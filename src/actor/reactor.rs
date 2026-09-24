@@ -1770,13 +1770,16 @@ impl Reactor {
                 let session_id = self.drag_manager.actor.await_modifier(button, point, action);
                 let source = self.window_id_under_cursor().and_then(|window| {
                     let state = self.state.windows.window(window)?;
-                    self.state.windows.is_admitted(window).then_some((
+                    // A claimed window is moved like a floating one; its owner keeps placement.
+                    let claimed = self.state.windows.external_manager(window).is_some();
+                    (claimed || self.state.windows.is_admitted(window)).then_some((
                         window,
                         state.frame_monotonic,
                         state.info.sys_id,
+                        claimed,
                     ))
                 });
-                let Some((window, frame, server_id)) = source else {
+                let Some((window, frame, server_id, claimed)) = source else {
                     let _ = self.drag_manager.actor.resolve_start(
                         session_id,
                         None,
@@ -1785,7 +1788,8 @@ impl Reactor {
                     return Ok(EventOutcome::no_change());
                 };
                 let space = self.best_space_for_window(&frame, server_id);
-                let tiled = !self.layout_manager.layout_engine.is_window_floating(window);
+                let tiled =
+                    !claimed && !self.layout_manager.layout_engine.is_window_floating(window);
                 let scene = if tiled && action == crate::common::config::MouseAction::Move {
                     space.map(|space| self.drag_scene(window, space)).unwrap_or_default()
                 } else {
