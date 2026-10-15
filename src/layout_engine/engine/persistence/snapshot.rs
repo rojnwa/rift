@@ -24,6 +24,8 @@ pub(super) struct PersistedLayout {
     #[serde(default)]
     pub(super) workspace_layouts: LegacyWorkspaceLayouts,
     pub(super) floating: FloatingManager,
+    #[serde(default)]
+    pub(super) scratchpad: Scratchpad,
     pub(super) floating_positions: FloatingPositionStore,
     #[serde(rename = "virtual_workspace_manager")]
     pub(super) workspaces: WorkspaceStore,
@@ -40,6 +42,7 @@ pub(super) struct PersistedLayout {
 struct PersistedLayoutRef<'a> {
     schema_version: u32,
     floating: &'a FloatingManager,
+    scratchpad: &'a Scratchpad,
     floating_positions: &'a FloatingPositionStore,
     #[serde(rename = "virtual_workspace_manager")]
     workspaces: &'a WorkspaceStore,
@@ -58,6 +61,7 @@ impl PersistedLayout {
         ron::ser::to_string(&PersistedLayoutRef {
             schema_version: CURRENT_SCHEMA_VERSION,
             floating: &engine.floating,
+            scratchpad: &engine.scratchpad,
             floating_positions: &engine.floating_positions,
             workspaces: &engine.workspaces,
             space_display_map: &engine.space_display_map,
@@ -95,6 +99,7 @@ impl PersistedLayout {
         LayoutEngine {
             scroll_boundary: None,
             floating: self.floating,
+            scratchpad: self.scratchpad,
             floating_positions: self.floating_positions,
             app_rules: AppRuleEngine::default(),
             focused_window: None,

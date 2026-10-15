@@ -124,6 +124,10 @@ pub struct AppWorkspaceRule {
     #[serde(default)]
     #[setting(custom)]
     pub focus: bool,
+    /// Park matching windows in the scratchpad when they appear (implies floating). Summon them
+    /// with the `toggle_scratchpad` command.
+    #[serde(default)]
+    pub scratchpad: bool,
     /// An explicit management override. `false` makes the window invisible to Rift;
     /// `true` overrides normal manageability heuristics for a visible window. When
     /// omitted, the matching rule leaves Rift's normal manageability decision intact.
@@ -359,6 +363,19 @@ impl VirtualWorkspaceSettings {
             {
                 issues.push(format!(
                     "App rule {} sets manage = false, so its workspace, floating, position, size, and focus effects are ignored",
+                    index
+                ));
+            }
+
+            if rule.scratchpad
+                && (rule.manage == Some(false)
+                    || rule.workspace.is_some()
+                    || rule.position.is_some()
+                    || rule.size.is_some()
+                    || rule.focus)
+            {
+                issues.push(format!(
+                    "App rule {} sets scratchpad = true (the window is parked on launch and shown via toggle_scratchpad), which cannot be combined with workspace, position, size, focus, or manage = false",
                     index
                 ));
             }

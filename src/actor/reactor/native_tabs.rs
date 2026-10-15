@@ -35,7 +35,7 @@ impl Reactor {
                 let wsid = window.info.sys_id?;
                 let space = self.layout_manager.layout_engine.space_with_window(old)?;
                 if !self.is_space_active(space)
-                    || self.window_in_non_active_workspace(space, old)
+                    || self.window_hidden_from_active_workspace(space, old)
                     || !(info.has_native_tabs || window.info.has_native_tabs)
                     || !(same_tab_frame(window.frame_monotonic, info.frame)
                         || native_frame
@@ -90,7 +90,7 @@ impl Reactor {
         let Some(space) = self.layout_manager.layout_engine.space_with_window(old) else {
             return false;
         };
-        if !self.is_space_active(space) || self.window_in_non_active_workspace(space, old) {
+        if !self.is_space_active(space) || self.window_hidden_from_active_workspace(space, old) {
             return false;
         }
         #[cfg(not(test))]

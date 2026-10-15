@@ -1,6 +1,7 @@
 pub mod engine;
 mod floating;
 pub(crate) mod graph;
+mod scratchpad;
 pub mod systems;
 pub mod utils;
 pub(crate) mod workspaces;
@@ -45,6 +46,7 @@ pub(crate) struct WindowDropRequest {
     pub space: crate::sys::screen::SpaceId,
     pub action: WindowDropAction,
 }
+pub(crate) use scratchpad::Scratchpad;
 pub(crate) use systems::LayoutId;
 pub use systems::{
     BspLayoutSystem, LayoutSystem, LayoutSystemKind, MasterStackLayoutSystem,

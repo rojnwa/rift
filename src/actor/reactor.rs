@@ -3816,7 +3816,7 @@ impl Reactor {
         let wid = self.state.windows.tracked_window_id(wsid)?;
         let assigned_space = self.assigned_space_for_window_id(wid)?;
         if !self.is_space_active(assigned_space)
-            || !self.window_in_non_active_workspace(assigned_space, wid)
+            || !self.window_hidden_from_active_workspace(assigned_space, wid)
         {
             return None;
         }
@@ -4353,12 +4353,27 @@ impl Reactor {
             return false;
         }
 
-        if !self.layout_manager.layout_engine.workspaces().is_window_in_active_workspace(
+        if !self.layout_manager.layout_engine.is_window_in_active_workspace(
             &self.state.windows,
             space,
             wid,
         ) {
             trace!("Ignoring mouse over window {:?} - not in active workspace", wid);
+            return false;
+        }
+
+        // A visible scratchpad window holds focus against hover; only a click or toggle moves it.
+        let engine = &self.layout_manager.layout_engine;
+        let active_workspace = engine.workspaces().active_workspace(space);
+        let scratchpad_holds_focus = engine.scratchpad_shown().any(|member| {
+            member != wid
+                && self.state.windows.workspace_for_window(space, member) == active_workspace
+        });
+        if scratchpad_holds_focus {
+            trace!(
+                ?wid,
+                "Ignoring mouse over window while a scratchpad window is shown"
+            );
             return false;
         }
 
@@ -4586,6 +4601,20 @@ impl Reactor {
         let Some(window_space) = self.best_space_for_window_id(app_window_id) else {
             return EventOutcome::no_change();
         };
+
+        // Cmd-Tab / Dock activation of a parked scratchpad window: show it rather than leave
+        // keyboard focus on an off-screen window.
+        if self.layout_manager.layout_engine.is_scratchpad_parked(app_window_id)
+            && let Some(screen) = self.space_state.screen_by_space(window_space).map(|s| s.frame)
+        {
+            let response = self.layout_manager.layout_engine.show_scratchpad_window(
+                &mut self.state.windows,
+                window_space,
+                screen,
+                app_window_id,
+            );
+            return EventOutcome::layout_changed(false).with_layout_response(response, None);
+        }
 
         self.maybe_auto_switch_to_window_workspace(pid, app_window_id, window_space)
     }
@@ -4976,7 +5005,7 @@ impl Reactor {
             };
             self.state.windows.is_window_visible(wsid)
                 && self.best_space_for_window_id(wid) == Some(space)
-                && self.layout_manager.layout_engine.workspaces().is_window_in_active_workspace(
+                && self.layout_manager.layout_engine.is_window_in_active_workspace(
                     &self.state.windows,
                     space,
                     wid,
@@ -5007,13 +5036,16 @@ impl Reactor {
         // would activate that display's selection and warp the cursor back.
         if (self.main_window() == Some(window_id)
             || self.layout_manager.layout_engine.focused_window() == Some(window_id))
-            && self.window_in_non_active_workspace(space, window_id)
+            && self.window_hidden_from_active_workspace(space, window_id)
         {
             self.refocus_manager.refocus_state = RefocusState::Pending(space);
         }
     }
 
-    fn window_in_non_active_workspace(&self, space: SpaceId, window_id: WindowId) -> bool {
+    fn window_hidden_from_active_workspace(&self, space: SpaceId, window_id: WindowId) -> bool {
+        if self.layout_manager.layout_engine.is_scratchpad_parked(window_id) {
+            return true;
+        }
         let Some(active_workspace) =
             self.layout_manager.layout_engine.workspaces().active_workspace(space)
         else {
@@ -5059,7 +5091,7 @@ impl Reactor {
                     .windows
                     .tracked_window_id(WindowServerId::new(native.idx.get()))
                     .unwrap_or(native);
-                if successor != wid && !self.window_in_non_active_workspace(space, successor) {
+                if successor != wid && !self.window_hidden_from_active_workspace(space, successor) {
                     if !self.state.windows.contains_window(successor) {
                         self.request_window_inventory(successor.pid);
                     }

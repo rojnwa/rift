@@ -196,6 +196,7 @@ pub(crate) fn assign_window(
     };
     match result {
         Ok(AppRuleResult::Managed(effects)) => (Some(effects), None),
+        Ok(AppRuleResult::Unchanged) => (None, None),
         Ok(AppRuleResult::Rejected(_)) => (
             None,
             utils::rejection_needs_removal(state, layout, wid, space)

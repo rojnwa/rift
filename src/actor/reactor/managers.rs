@@ -17,6 +17,7 @@ use crate::common::collections::{HashMap, HashSet};
 use crate::common::config::{DragDropSettings, LayoutMode};
 use crate::layout_engine::LayoutEngine;
 use crate::model::broadcast::{BroadcastEvent, BroadcastSender, protocol_workspace_id};
+use crate::model::{HiddenWindowPlacement, HideCorner};
 use crate::sys::screen::SpaceId;
 
 /// Manages application state and rules
@@ -209,6 +210,37 @@ pub struct LayoutManager {
 
 pub type LayoutResult = Vec<(SpaceId, Vec<(WindowId, CGRect)>)>;
 
+/// Parked scratchpad windows belong to no workspace, so the per-space layout never sees them.
+/// Park each one in the hidden corner of the in-scope screen it currently sits on.
+fn place_parked_scratchpad_windows(
+    reactor: &Reactor,
+    screens_in_scope: &[(SpaceId, CGRect)],
+    all_screen_frames: &[CGRect],
+    layout_result: &mut LayoutResult,
+) {
+    let engine = &reactor.layout_manager.layout_engine;
+    for wid in engine.scratchpad_parked() {
+        let Some(frame) = reactor.state.windows.window(wid).map(|w| w.frame_monotonic) else {
+            continue;
+        };
+        let current_space = reactor.best_space_for_window_id(wid);
+        let target = screens_in_scope
+            .iter()
+            .find(|(space, _)| Some(*space) == current_space)
+            .or_else(|| current_space.is_none().then(|| screens_in_scope.first()).flatten());
+        let Some((space, screen)) = target else {
+            continue;
+        };
+        let others: Vec<_> =
+            all_screen_frames.iter().copied().filter(|other| other != screen).collect();
+        let hidden =
+            HiddenWindowPlacement::calculate(*screen, frame, HideCorner::BottomRight, &others);
+        if let Some((_, positions)) = layout_result.iter_mut().find(|(s, _)| s == space) {
+            positions.push((wid, hidden));
+        }
+    }
+}
+
 // macOS does not clip windows to a scrolling viewport. Constrain only edges
 // facing another display; unoccupied edges must allow normal offscreen motion.
 #[derive(Debug, Clone, Copy)]
@@ -382,6 +414,7 @@ impl LayoutManager {
         let screens = reactor.space_state.screens.clone();
         let all_screen_frames: Vec<CGRect> = screens.iter().map(|s| s.frame).collect();
         let mut layout_result = LayoutResult::new();
+        let mut screens_in_scope = Vec::new();
 
         for screen in screens {
             let Some(space) = screen.space else {
@@ -433,9 +466,16 @@ impl LayoutManager {
                     &active_workspace_windows,
                 );
             }
+            screens_in_scope.push((space, screen.frame));
             layout_result.push((space, layout));
         }
 
+        place_parked_scratchpad_windows(
+            reactor,
+            &screens_in_scope,
+            &all_screen_frames,
+            &mut layout_result,
+        );
         layout_result
     }
 

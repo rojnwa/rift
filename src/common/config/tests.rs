@@ -126,6 +126,7 @@ fn app_rule_geometry_validation_rejects_invalid_values() {
             h: Some(f64::NAN),
         }),
         focus: false,
+        scratchpad: false,
         manage: Some(true),
         app_name: None,
         title_regex: None,
@@ -171,6 +172,56 @@ fn horizontal_mouse_warp_config_parsing() {
         assert_eq!(settings.horizontal_mouse_warp, Some(expected));
     }
     assert!(toml::from_str::<Settings>("horizontal_mouse_warp = \"sideways\"").is_err());
+}
+
+#[test]
+fn app_rule_scratchpad_parses_and_rejects_conflicting_effects() {
+    let settings: VirtualWorkspaceSettings = toml::from_str(
+        r#"
+            app_rules = [{ app_id = "net.kovidgoyal.kitty", title_substring = "Scratchpad", scratchpad = true }]
+        "#,
+    )
+    .unwrap();
+    assert!(settings.app_rules[0].scratchpad);
+    assert!(settings.validate().is_empty());
+
+    let mut conflicting = VirtualWorkspaceSettings::default();
+    conflicting.app_rules.push(AppWorkspaceRule {
+        app_id: Some("com.example.Tool".into()),
+        scratchpad: true,
+        floating: true,
+        position: Some(AppRulePosition { x: 0.5, y: 0.5 }),
+        ..Default::default()
+    });
+    let issues = conflicting.validate();
+    assert!(
+        issues.iter().any(|issue| issue.contains("scratchpad")),
+        "position must be rejected together with scratchpad: {issues:?}"
+    );
+}
+
+#[test]
+fn scratchpad_commands_parse_from_key_bindings() {
+    #[derive(Deserialize)]
+    struct TestConfig {
+        keys: HashMap<String, WmCommand>,
+    }
+    let parsed: TestConfig = toml::from_str(
+        r#"
+        [keys]
+        toggle = "toggle_scratchpad"
+        park = "move_to_scratchpad"
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        parsed.keys["toggle"],
+        WmCommand::ReactorCommand(reactor::Command::Layout(LayoutCommand::ToggleScratchpad))
+    );
+    assert_eq!(
+        parsed.keys["park"],
+        WmCommand::ReactorCommand(reactor::Command::Layout(LayoutCommand::MoveToScratchpad))
+    );
 }
 
 #[test]
