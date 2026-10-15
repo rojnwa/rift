@@ -47,6 +47,7 @@ pub struct DragManager {
     pub(super) preview: Option<crate::ui::drag_preview::DragPreview>,
     pub(super) preview_enabled: bool,
     pub(super) preview_suppressed: bool,
+    pub(super) haptics_enabled: bool,
 }
 
 impl DragManager {
@@ -70,6 +71,7 @@ impl DragManager {
     }
 
     pub fn update_config(&mut self, config: DragDropSettings) {
+        self.haptics_enabled = config.haptics_enabled;
         self.actor.update_config(config);
         self.preview_enabled = config.enabled && config.preview;
         if !config.enabled || !config.preview {
@@ -135,6 +137,7 @@ pub struct NotificationManager {
 pub struct MenuManager {
     pub menu_state: super::MenuState,
     pub menu_tx: Option<menu_bar::Sender>,
+    pub last_projection_signature: Option<u64>,
 }
 
 /// Manages Mission Control state
@@ -144,7 +147,6 @@ pub struct MissionControlManager {
 
 /// Owns ordering and coalescing for asynchronous AX window inventories.
 pub struct WindowInventoryManager {
-    pub topology_revision: u64,
     pub next_request_id: u64,
     pub in_flight: HashMap<pid_t, WindowInventoryToken>,
     pub pending: HashSet<pid_t>,
@@ -185,43 +187,6 @@ pub struct RefocusManager {
     pub refocus_state: super::RefocusState,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RefreshQuarantineState {
-    Ready,
-    Sleeping,
-    SessionInactive,
-    DisplayChurn,
-}
-
-pub struct RefreshQuarantineManager {
-    pub sleeping: bool,
-    pub session_inactive: bool,
-    pub display_churn_active: bool,
-    pub awaiting_post_wake_snapshot: bool,
-    pub awaiting_post_session_snapshot: bool,
-    pub pending_inventory_refresh: bool,
-    /// LoginWindow/AppKit can replay application activations while restoring a
-    /// session. Those activations are not user intent and must not drive a
-    /// virtual-workspace switch. Explicit input clears this latch.
-    pub suppress_auto_workspace_switch_until_input: bool,
-}
-
-impl RefreshQuarantineManager {
-    pub fn state(&self) -> RefreshQuarantineState {
-        if self.sleeping {
-            RefreshQuarantineState::Sleeping
-        } else if self.session_inactive {
-            RefreshQuarantineState::SessionInactive
-        } else if self.display_churn_active {
-            RefreshQuarantineState::DisplayChurn
-        } else {
-            RefreshQuarantineState::Ready
-        }
-    }
-
-    pub fn blocks_refreshes(&self) -> bool { self.state() != RefreshQuarantineState::Ready }
-}
-
 /// Manages communication channels to other actors
 pub struct CommunicationManager {
     pub input_tx: Option<input::Sender>,
@@ -244,24 +209,58 @@ pub struct LayoutManager {
 
 pub type LayoutResult = Vec<(SpaceId, Vec<(WindowId, CGRect)>)>;
 
-fn bound_frame_to_screen(frame: CGRect, screen: CGRect) -> CGRect {
-    const WINDOW_HIDDEN_THRESHOLD: f64 = 10.0;
+// macOS does not clip windows to a scrolling viewport. Constrain only edges
+// facing another display; unoccupied edges must allow normal offscreen motion.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ScrollingDisplayBounds {
+    screen: CGRect,
+    left: bool,
+    right: bool,
+}
 
+impl ScrollingDisplayBounds {
+    pub(super) fn for_screen(screen: CGRect, screens: &[CGRect]) -> Option<Self> {
+        let mut bounds = Self {
+            screen,
+            left: false,
+            right: false,
+        };
+        for other in screens {
+            // A display above/below the strip cannot receive horizontal overflow.
+            if other.max().y <= screen.origin.y || other.origin.y >= screen.max().y {
+                continue;
+            }
+            bounds.left |= other.max().x <= screen.origin.x;
+            bounds.right |= other.origin.x >= screen.max().x;
+        }
+        (bounds.left || bounds.right).then_some(bounds)
+    }
+
+    pub(super) fn apply(self, frame: CGRect) -> CGRect {
+        let mut bounded = bound_frame_to_screen(frame, self.screen);
+        // Preserve offscreen motion on edges without a neighboring display.
+        if !self.left {
+            bounded.origin.x = frame.origin.x.min(self.screen.max().x - frame.size.width);
+        } else if !self.right {
+            bounded.origin.x = frame.origin.x.max(self.screen.origin.x);
+        }
+        bounded
+    }
+}
+
+pub(super) fn bound_frame_to_screen(frame: CGRect, screen: CGRect) -> CGRect {
     let screen_left = screen.origin.x;
     let screen_top = screen.origin.y;
     let screen_right = screen.max().x;
     let screen_bottom = screen.max().y;
+    let max_x = (screen_right - frame.size.width).max(screen_left);
     let max_y = (screen_bottom - frame.size.height).max(screen_top);
-    let x = if frame.max().x <= screen_left {
-        screen_left - frame.size.width + WINDOW_HIDDEN_THRESHOLD
-    } else if frame.origin.x >= screen_right {
-        screen_right - WINDOW_HIDDEN_THRESHOLD
-    } else {
-        frame.origin.x
-    };
 
     CGRect::new(
-        CGPoint::new(x, frame.origin.y.clamp(screen_top, max_y)),
+        CGPoint::new(
+            frame.origin.x.clamp(screen_left, max_x),
+            frame.origin.y.clamp(screen_top, max_y),
+        ),
         frame.size,
     )
 }
@@ -269,7 +268,7 @@ fn bound_frame_to_screen(frame: CGRect, screen: CGRect) -> CGRect {
 fn bound_scrolling_tiled_frames_to_screen(
     reactor: &Reactor,
     layout: &mut Vec<(WindowId, CGRect)>,
-    screen: CGRect,
+    bounds: ScrollingDisplayBounds,
     active_workspace_windows: &HashSet<WindowId>,
 ) {
     for (wid, frame) in layout.iter_mut() {
@@ -278,11 +277,94 @@ fn bound_scrolling_tiled_frames_to_screen(
         {
             continue;
         }
-        *frame = bound_frame_to_screen(*frame, screen);
+        *frame = bounds.apply(*frame);
     }
 }
 
 impl LayoutManager {
+    fn publish_stack_tabs(
+        reactor: &Reactor,
+        space: SpaceId,
+        group_infos: &[crate::layout_engine::engine::GroupContainerInfo],
+        active_workspace_for_space_has_fullscreen: bool,
+        reorder: bool,
+    ) {
+        if reactor.config.settings.ui.stack_line.enabled
+            && let Some(tx) = &reactor.communication_manager.stack_line_tx
+        {
+            let groups: Vec<crate::actor::stack_line::GroupInfo> = group_infos
+                .iter()
+                .map(|g| crate::actor::stack_line::GroupInfo {
+                    node_id: g.node_id,
+                    space_id: space,
+                    frame: g.frame,
+                    horizontal: g.container_kind != crate::layout_engine::LayoutKind::VerticalStack,
+                    selected_index: g.selected_index,
+                    tabs: g
+                        .window_ids
+                        .iter()
+                        .map(|&window_id| {
+                            let info = reactor.state.windows.window(window_id).map(|w| &w.info);
+                            crate::actor::stack_line::TabInfo {
+                                window_id,
+                                title: info.map(|i| i.title.clone()).unwrap_or_default(),
+                                bundle_id: info.and_then(|i| i.bundle_id.clone()),
+                                window_server_id: reactor
+                                    .state
+                                    .windows
+                                    .record(window_id)
+                                    .and_then(|record| record.window_server_id()),
+                            }
+                        })
+                        .collect(),
+                })
+                .collect();
+            let active_space_ids: Vec<crate::sys::screen::SpaceId> =
+                reactor.iter_active_spaces().collect();
+
+            if let Err(e) = tx.try_send(crate::actor::stack_line::Event::GroupsUpdated {
+                active_space_ids,
+                space_id: space,
+                groups,
+                active_workspace_for_space_has_fullscreen,
+                reorder,
+            }) {
+                tracing::warn!("Failed to send groups update to stack_line: {}", e);
+            }
+        }
+    }
+
+    pub(super) fn refresh_stack_tabs(reactor: &mut Reactor, space: SpaceId) {
+        if !reactor.config.settings.ui.stack_line.enabled
+            || reactor.communication_manager.stack_line_tx.is_none()
+            || !reactor.is_space_active(space)
+        {
+            return;
+        }
+        let Some(screen) = reactor.space_state.screen_by_space(space) else {
+            return;
+        };
+        let frame = screen.frame;
+        let gaps = reactor
+            .config
+            .settings
+            .layout
+            .gaps
+            .effective_for_display(screen.display_uuid_owned().as_deref());
+        let groups = reactor.layout_manager.layout_engine.collect_group_containers(
+            space,
+            frame,
+            &gaps,
+            reactor.config.settings.ui.stack_line.reserve(),
+        );
+        let fullscreen = reactor.workspace_command_space() == Some(space)
+            && reactor
+                .layout_manager
+                .layout_engine
+                .active_workspace_for_space_has_fullscreen(space);
+        Self::publish_stack_tabs(reactor, space, &groups, fullscreen, true);
+    }
+
     pub fn update_layout(
         reactor: &mut Reactor,
         is_resize: bool,
@@ -299,11 +381,6 @@ impl LayoutManager {
         }
         let screens = reactor.space_state.screens.clone();
         let all_screen_frames: Vec<CGRect> = screens.iter().map(|s| s.frame).collect();
-        let active_space_count = screens
-            .iter()
-            .filter_map(|screen| screen.space)
-            .filter(|space| reactor.is_space_active(*space))
-            .count();
         let mut layout_result = LayoutResult::new();
 
         for screen in screens {
@@ -333,26 +410,26 @@ impl LayoutManager {
                     space,
                     screen.frame.clone(),
                     &gaps,
-                    reactor.config.settings.ui.stack_line.thickness(),
-                    reactor.config.settings.ui.stack_line.horiz_placement,
-                    reactor.config.settings.ui.stack_line.vert_placement,
+                    reactor.config.settings.ui.stack_line.reserve(),
                     |wid| reactor.state.windows.window(wid).map(|w| w.frame_monotonic),
                     &all_screen_frames,
                 );
-            if active_space_count > 1
-                && reactor.layout_manager.layout_engine.active_layout_mode_at(space)
-                    == LayoutMode::Scrolling
+            if reactor.layout_manager.layout_engine.active_layout_mode_at(space)
+                == LayoutMode::Scrolling
+                && let Some(bounds) =
+                    ScrollingDisplayBounds::for_screen(screen.frame, &all_screen_frames)
             {
                 let active_workspace_windows: HashSet<WindowId> = reactor
                     .layout_manager
                     .layout_engine
+                    .workspaces()
                     .windows_in_active_workspace(&reactor.state.windows, space)
                     .into_iter()
                     .collect();
                 bound_scrolling_tiled_frames_to_screen(
                     reactor,
                     &mut layout,
-                    screen.frame,
+                    bounds,
                     &active_workspace_windows,
                 );
             }
@@ -393,45 +470,25 @@ impl LayoutManager {
                     space,
                     screen_frame,
                     &gaps,
-                    reactor.config.settings.ui.stack_line.thickness(),
-                    reactor.config.settings.ui.stack_line.horiz_placement,
-                    reactor.config.settings.ui.stack_line.vert_placement,
+                    reactor.config.settings.ui.stack_line.reserve(),
                 );
 
-                // Keep internal stack-line UI actor fed from the same group snapshot.
-                if reactor.config.settings.ui.stack_line.enabled
-                    && let Some(tx) = &reactor.communication_manager.stack_line_tx
-                {
-                    let groups: Vec<crate::actor::stack_line::GroupInfo> = group_infos
-                        .iter()
-                        .map(|g| crate::actor::stack_line::GroupInfo {
-                            node_id: g.node_id,
-                            space_id: space,
-                            container_kind: g.container_kind,
-                            frame: g.frame,
-                            total_count: g.total_count,
-                            selected_index: g.selected_index,
-                            window_ids: g.window_ids.clone(),
-                        })
-                        .collect();
-                    let active_space_ids: Vec<crate::sys::screen::SpaceId> =
-                        reactor.iter_active_spaces().collect();
-
-                    if let Err(e) = tx.try_send(crate::actor::stack_line::Event::GroupsUpdated {
-                        active_space_ids,
-                        space_id: space,
-                        groups,
-                        active_workspace_for_space_has_fullscreen,
-                    }) {
-                        tracing::warn!("Failed to send groups update to stack_line: {}", e);
-                    }
-                }
+                Self::publish_stack_tabs(
+                    reactor,
+                    space,
+                    &group_infos,
+                    active_workspace_for_space_has_fullscreen,
+                    false,
+                );
 
                 if let Some(workspace_id) =
-                    reactor.layout_manager.layout_engine.active_workspace(space)
+                    reactor.layout_manager.layout_engine.workspaces().active_workspace(space)
                 {
-                    let workspace_index =
-                        reactor.layout_manager.layout_engine.active_workspace_idx(space);
+                    let workspace_index = reactor
+                        .layout_manager
+                        .layout_engine
+                        .workspaces()
+                        .active_workspace_idx(space);
                     let workspace_name = reactor
                         .layout_manager
                         .layout_engine
@@ -440,24 +497,35 @@ impl LayoutManager {
 
                     let stacks: Vec<StackInfo> = group_infos
                         .iter()
-                        .map(|g| StackInfo {
-                            container_kind: match g.container_kind {
-                                crate::layout_engine::LayoutKind::Horizontal => {
-                                    rift_protocol::LayoutKind::Horizontal
-                                }
-                                crate::layout_engine::LayoutKind::Vertical => {
-                                    rift_protocol::LayoutKind::Vertical
-                                }
-                                crate::layout_engine::LayoutKind::HorizontalStack => {
-                                    rift_protocol::LayoutKind::HorizontalStack
-                                }
-                                crate::layout_engine::LayoutKind::VerticalStack => {
-                                    rift_protocol::LayoutKind::VerticalStack
-                                }
-                            },
-                            total_count: g.total_count,
-                            selected_index: g.selected_index,
-                            windows: g.window_ids.iter().map(WindowId::to_debug_string).collect(),
+                        .map(|g| {
+                            // Clients have always received vertical stacks bottom to top.
+                            let mut windows: Vec<_> =
+                                g.window_ids.iter().map(WindowId::to_debug_string).collect();
+                            let mut selected_index = g.selected_index;
+                            if g.container_kind == crate::layout_engine::LayoutKind::VerticalStack {
+                                windows.reverse();
+                                selected_index =
+                                    windows.len().saturating_sub(1).saturating_sub(selected_index);
+                            }
+                            StackInfo {
+                                total_count: g.total_count,
+                                container_kind: match g.container_kind {
+                                    crate::layout_engine::LayoutKind::Horizontal => {
+                                        rift_protocol::LayoutKind::Horizontal
+                                    }
+                                    crate::layout_engine::LayoutKind::Vertical => {
+                                        rift_protocol::LayoutKind::Vertical
+                                    }
+                                    crate::layout_engine::LayoutKind::HorizontalStack => {
+                                        rift_protocol::LayoutKind::HorizontalStack
+                                    }
+                                    crate::layout_engine::LayoutKind::VerticalStack => {
+                                        rift_protocol::LayoutKind::VerticalStack
+                                    }
+                                },
+                                selected_index,
+                                windows,
+                            }
                         })
                         .collect();
 
@@ -502,45 +570,74 @@ pub struct PendingSpaceChangeManager {
 mod tests {
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 
-    use super::bound_frame_to_screen;
+    use super::{ScrollingDisplayBounds, bound_frame_to_screen};
 
     fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
         CGRect::new(CGPoint::new(x, y), CGSize::new(w, h))
     }
 
     #[test]
-    fn bound_frame_to_screen_keeps_partial_overlap_for_strip_behavior() {
+    fn bound_frame_to_screen_contains_partially_visible_left_window() {
         let screen = rect(2000.0, 0.0, 1000.0, 800.0);
         let frame = rect(1500.0, 50.0, 700.0, 400.0);
         let bounded = bound_frame_to_screen(frame, screen);
-        assert_eq!(bounded.origin.x, 1500.0);
+        assert_eq!(bounded.origin.x, 2000.0);
         assert_eq!(bounded.size.width, 700.0);
     }
 
     #[test]
-    fn bound_frame_to_screen_parks_fully_offscreen_windows_to_hidden_sliver() {
+    fn bound_frame_to_screen_contains_fully_offscreen_left_window() {
         let screen = rect(2000.0, 0.0, 1000.0, 800.0);
         let frame = rect(1200.0, 80.0, 600.0, 300.0);
         let bounded = bound_frame_to_screen(frame, screen);
-        assert_eq!(bounded.origin.x, 1410.0);
+        assert_eq!(bounded.origin.x, 2000.0);
         assert_eq!(bounded.size.width, 600.0);
     }
 
     #[test]
-    fn bound_frame_to_screen_parks_right_offscreen_windows_to_hidden_sliver() {
+    fn bound_frame_to_screen_contains_fully_offscreen_right_window() {
         let screen = rect(2000.0, 0.0, 1000.0, 800.0);
         let frame = rect(3200.0, 80.0, 600.0, 300.0);
         let bounded = bound_frame_to_screen(frame, screen);
-        assert_eq!(bounded.origin.x, 2990.0);
+        assert_eq!(bounded.origin.x, 2400.0);
         assert_eq!(bounded.size.width, 600.0);
     }
 
     #[test]
-    fn bound_frame_to_screen_does_not_park_partially_visible_right_windows() {
+    fn bound_frame_to_screen_contains_partially_visible_right_window() {
         let screen = rect(2000.0, 0.0, 1000.0, 800.0);
         let frame = rect(2998.0, 80.0, 600.0, 300.0);
         let bounded = bound_frame_to_screen(frame, screen);
-        assert_eq!(bounded.origin.x, 2998.0);
+        assert_eq!(bounded.origin.x, 2400.0);
         assert_eq!(bounded.size.width, 600.0);
+    }
+
+    #[test]
+    fn contained_scrolling_columns_expose_both_edges_on_the_owning_display() {
+        let screen = rect(1728.0, 0.0, 2560.0, 1400.0);
+        let width = 2048.0;
+        let left = rect(0.0, 0.0, 1728.0, 1400.0);
+        let right = rect(4288.0, 0.0, 1728.0, 1400.0);
+        let above = rect(1310.0, -1440.0, 2560.0, 1440.0);
+        for (neighbors, expected) in [
+            (vec![left, right], (1728.0, 1984.0, 2240.0)),
+            (vec![left], (1728.0, 1984.0, 4032.0)),
+            (vec![right], (-64.0, 1984.0, 2240.0)),
+            (vec![above], (-64.0, 1984.0, 4032.0)),
+        ] {
+            let bounds = ScrollingDisplayBounds::for_screen(screen, &neighbors);
+            let frame = |x| {
+                let frame = rect(x, 0.0, width, 1400.0);
+                bounds.map_or(frame, |bounds| bounds.apply(frame))
+            };
+            assert_eq!(
+                (
+                    frame(-64.0).origin.x,
+                    frame(1984.0).origin.x,
+                    frame(4032.0).origin.x
+                ),
+                expected
+            );
+        }
     }
 }

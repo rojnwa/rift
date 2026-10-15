@@ -25,7 +25,7 @@ pub struct LayoutCommandPayload {
     pub command: LayoutCommand,
     pub command_space: Option<SpaceId>,
     pub visible_spaces: Vec<SpaceId>,
-    pub visible_space_centers: HashMap<SpaceId, objc2_core_foundation::CGPoint>,
+    pub visible_space_frames: HashMap<SpaceId, objc2_core_foundation::CGRect>,
     pub post_arrange_mouse_warp: Option<WindowId>,
 }
 
@@ -39,12 +39,19 @@ pub fn handle_command_layout(
         command: cmd,
         command_space,
         visible_spaces,
-        visible_space_centers,
+        visible_space_frames,
         post_arrange_mouse_warp,
     } = payload;
     info!(?cmd);
     let is_move_node = matches!(cmd, LayoutCommand::MoveNode(_));
     let is_selection_command = matches!(cmd, LayoutCommand::Ascend | LayoutCommand::Descend);
+    let is_focus_command = matches!(
+        cmd,
+        LayoutCommand::NextWindow
+            | LayoutCommand::PrevWindow
+            | LayoutCommand::MoveFocus(_)
+            | LayoutCommand::ToggleFocusFloating
+    );
     let is_workspace_switch = matches!(
         cmd,
         LayoutCommand::NextWorkspace(_)
@@ -92,9 +99,7 @@ pub fn handle_command_layout(
     } else {
         None
     };
-    if is_workspace_switch {
-        workspace_switch.start_workspace_switch(WorkspaceSwitchOrigin::Manual);
-    } else {
+    if !is_workspace_switch {
         workspace_switch.mark_workspace_switch_inactive();
     }
 
@@ -135,21 +140,40 @@ pub fn handle_command_layout(
                 &mut state.windows,
                 command_space,
                 &visible_spaces,
-                &visible_space_centers,
+                &visible_space_frames,
                 cmd,
             )
         }
     };
 
     if is_virtual_workspace_command && !response.changed {
+        if is_workspace_switch {
+            workspace_switch.mark_workspace_switch_inactive();
+            workspace_switch.active_workspace_switch = None;
+        }
         return Ok(EventOutcome::no_change());
     }
 
-    let selection_changed = is_selection_command && response.changed;
+    // Only begin the switch lifecycle once a real transition has been produced.
+    if is_workspace_switch {
+        workspace_switch.start_workspace_switch(WorkspaceSwitchOrigin::Manual);
+    }
+
+    let response_changed = response.changed;
+    let selection_changed = is_selection_command && response_changed;
     let arrange_space_scope = is_workspace_switch.then_some(workspace_space).flatten();
-    let mut outcome = EventOutcome::layout_changed(false)
-        .with_layout_response(response, workspace_space)
-        .with_arrange_space_scope(arrange_space_scope);
+    // Geometry commands must reconcile frames even when their layout-system
+    // operation has no explicit change result. Focus, selection and workspace
+    // commands provide one, so preserve their no-op behavior.
+    let needs_arrange = response_changed
+        || (!is_focus_command && !is_selection_command && !is_virtual_workspace_command);
+    let mut outcome = if needs_arrange {
+        EventOutcome::layout_changed(false)
+    } else {
+        EventOutcome::no_change()
+    }
+    .with_layout_response(response, workspace_space)
+    .with_arrange_space_scope(arrange_space_scope);
     outcome.broadcast_selection_changed = selection_changed;
     if is_move_node && let Some(window) = post_arrange_mouse_warp {
         outcome.post_arrange_mouse_warp = Some(window);
@@ -166,6 +190,7 @@ fn current_floating_positions(
         == crate::common::config::LayoutMode::Floating;
     layout
         .layout_engine
+        .workspaces()
         .windows_in_active_workspace(&state.windows, space)
         .into_iter()
         .filter(|window| floats_by_layout || layout.layout_engine.is_window_floating(*window))
@@ -309,8 +334,15 @@ pub fn handle_command_reactor_toggle_space_activated(
     };
     policy.toggle_space_activated(payload.config, ToggleSpaceContext {
         space,
-        display_uuid: payload.display_uuid,
+        display_uuid: payload.display_uuid.clone(),
     });
+    let enabled = policy.compute_active_spaces(
+        payload.config,
+        &[Some(space)],
+        std::slice::from_ref(&payload.display_uuid),
+    )[0]
+    .is_some();
+    info!(?space, display_uuid = ?payload.display_uuid, enabled, "Toggled Rift space management");
     Ok(EventOutcome::layout_changed(false).with_active_space_recompute())
 }
 
@@ -451,10 +483,7 @@ pub fn handle_command_reactor_move_window_to_display(
         .is_some()
         && let Some(window_server_id) = payload.window_server_id
     {
-        state
-            .windows
-            .set_window_server_space(window_server_id, Some(payload.target_space));
-        state.windows.mark_window_visible(window_server_id);
+        state.windows.observe_native_space(window_server_id, payload.target_space, true);
     }
 
     Ok(EventOutcome::layout_changed(false)
@@ -525,8 +554,7 @@ pub fn handle_command_reactor_move_workspace_to_display(
             window.frame_monotonic = window_move.target_frame;
         }
         if let Some(window_server_id) = window_move.window_server_id {
-            state.windows.set_window_server_space(window_server_id, Some(target_space));
-            state.windows.mark_window_visible(window_server_id);
+            state.windows.observe_native_space(window_server_id, target_space, true);
         }
         applied_moves.push(window_move);
     }

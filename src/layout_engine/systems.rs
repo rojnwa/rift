@@ -8,7 +8,7 @@ use crate::layout_engine::{Direction, LayoutKind, ResizeOrientation};
 
 slotmap::new_key_type! { pub struct LayoutId; }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct WindowLayoutConstraints {
     pub is_resizable: bool,
     pub locked_width: f64,
@@ -142,6 +142,17 @@ pub trait LayoutSystem: Serialize + for<'de> Deserialize<'de> {
     /// Return a stable, platform-neutral view of the layout topology for IPC consumers.
     fn container_tree(&self, layout: LayoutId) -> rift_protocol::ContainerTreeNode;
 
+    /// Reconcile screen/constraint changes before reading frames. Layouts with
+    /// cached world geometry can keep viewport-only updates independent of sizing.
+    fn prepare_layout(
+        &mut self,
+        _layout: LayoutId,
+        _screen: CGRect,
+        _constraints: &HashMap<WindowId, WindowLayoutConstraints>,
+        _gaps: &crate::common::config::GapSettings,
+    ) {
+    }
+
     fn calculate_layout(
         &self,
         layout: LayoutId,
@@ -149,9 +160,7 @@ pub trait LayoutSystem: Serialize + for<'de> Deserialize<'de> {
         stack_offset: f64,
         constraints: &HashMap<WindowId, WindowLayoutConstraints>,
         gaps: &crate::common::config::GapSettings,
-        stack_line_thickness: f64,
-        stack_line_horiz: crate::common::config::HorizontalPlacement,
-        stack_line_vert: crate::common::config::VerticalPlacement,
+        stack_line: crate::common::config::StackLineReserve,
     ) -> Vec<(WindowId, CGRect)>;
 
     fn selected_window(&self, layout: LayoutId) -> Option<WindowId>;
@@ -179,6 +188,15 @@ pub trait LayoutSystem: Serialize + for<'de> Deserialize<'de> {
     ) -> (Option<WindowId>, Vec<WindowId>);
     fn window_in_direction(&self, layout: LayoutId, direction: Direction) -> Option<WindowId>;
     fn add_window_after_selection(&mut self, layout: LayoutId, wid: WindowId);
+    /// Insert a window arriving from another display at the edge it crossed.
+    fn add_window_from_direction(
+        &mut self,
+        layout: LayoutId,
+        wid: WindowId,
+        _direction: Direction,
+    ) {
+        self.add_window_after_selection(layout, wid);
+    }
     /// Replace a window identity in-place without changing its layout position.
     fn replace_window(&mut self, from: WindowId, to: WindowId);
     fn remove_window(&mut self, wid: WindowId);
@@ -233,6 +251,15 @@ pub trait LayoutSystem: Serialize + for<'de> Deserialize<'de> {
     }
 
     fn move_selection(&mut self, layout: LayoutId, direction: Direction) -> bool;
+    /// Give the adjacent display priority over creating a new outer split.
+    fn move_selection_with_display_neighbor(
+        &mut self,
+        layout: LayoutId,
+        direction: Direction,
+        _has_neighbor: bool,
+    ) -> bool {
+        self.move_selection(layout, direction)
+    }
     fn move_selection_to_layout_after_selection(
         &mut self,
         from_layout: LayoutId,
@@ -376,8 +403,8 @@ pub(crate) mod constraints;
 pub use bsp::BspLayoutSystem;
 mod master_stack;
 pub use master_stack::MasterStackLayoutSystem;
-mod scrolling;
-pub use scrolling::ScrollingLayoutSystem;
+pub(crate) mod scrolling;
+pub use scrolling::{ScrollingLayoutSystem, ViewportRelease};
 
 #[cfg(test)]
 mod tests {

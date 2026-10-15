@@ -290,18 +290,26 @@ impl TraditionalLayoutSystem {
                 self.tree.data.layout.recompute_total(&self.tree.map, parent);
             }
         } else {
-            let container = self.tree.mk_node().insert_before(target_anchor);
-            self.tree.data.layout.assume_size_of(container, target_anchor, &self.tree.map);
-            self.set_layout(container, match direction.orientation() {
+            let kind = match direction.orientation() {
                 Orientation::Horizontal => LayoutKind::Horizontal,
                 Orientation::Vertical => LayoutKind::Vertical,
-            });
-            for node in if before {
-                [source_node, target_anchor]
+            };
+            let container = if target_anchor.parent(self.map()).is_none() {
+                // A root stack needs a new layout root, rather than a sibling.
+                self.nest_in_container_internal(layout, target_anchor, kind)
             } else {
-                [target_anchor, source_node]
-            } {
-                node.detach(&mut self.tree).push_back(container);
+                let container = self.tree.mk_node().insert_before(target_anchor);
+                self.tree.data.layout.assume_size_of(container, target_anchor, &self.tree.map);
+                self.set_layout(container, kind);
+                container
+            };
+            // Attach the stack first: extracting the source can collapse a
+            // two-window stack and invalidate target_anchor after reattachment.
+            target_anchor.detach(&mut self.tree).push_back(container);
+            if before {
+                source_node.detach(&mut self.tree).insert_before(target_anchor);
+            } else {
+                source_node.detach(&mut self.tree).push_back(container);
             }
         }
         self.select(source_node);
@@ -316,9 +324,7 @@ impl TraditionalLayoutSystem {
         stack_offset: f64,
         constraints: &HashMap<WindowId, WindowLayoutConstraints>,
         gaps: &crate::common::config::GapSettings,
-        stack_line_thickness: f64,
-        stack_line_horiz: crate::common::config::HorizontalPlacement,
-        stack_line_vert: crate::common::config::VerticalPlacement,
+        stack_line: crate::common::config::StackLineReserve,
     ) -> Vec<(WindowId, CGRect)> {
         let mut sizes = vec![];
         self.tree.data.layout.apply_with_gaps(
@@ -332,9 +338,7 @@ impl TraditionalLayoutSystem {
             stack_offset,
             constraints,
             gaps,
-            stack_line_thickness,
-            stack_line_horiz,
-            stack_line_vert,
+            stack_line,
         );
         sizes
     }
@@ -644,9 +648,7 @@ impl LayoutSystem for TraditionalLayoutSystem {
         stack_offset: f64,
         constraints: &HashMap<WindowId, WindowLayoutConstraints>,
         gaps: &crate::common::config::GapSettings,
-        stack_line_thickness: f64,
-        stack_line_horiz: crate::common::config::HorizontalPlacement,
-        stack_line_vert: crate::common::config::VerticalPlacement,
+        stack_line: crate::common::config::StackLineReserve,
     ) -> Vec<(WindowId, CGRect)> {
         let mut sizes = vec![];
         let tiling_area = compute_tiling_area(screen, gaps);
@@ -662,9 +664,7 @@ impl LayoutSystem for TraditionalLayoutSystem {
             stack_offset,
             constraints,
             gaps,
-            stack_line_thickness,
-            stack_line_horiz,
-            stack_line_vert,
+            stack_line,
         );
 
         sizes
@@ -789,6 +789,28 @@ impl LayoutSystem for TraditionalLayoutSystem {
         self.select(node);
     }
 
+    fn add_window_from_direction(&mut self, layout: LayoutId, wid: WindowId, direction: Direction) {
+        let mut root = self.root(layout);
+        if root.children(self.map()).next().is_some()
+            && (self.layout(root).is_stacked()
+                || self.layout(root).orientation() != direction.orientation())
+        {
+            root = self.nest_in_container_internal(
+                layout,
+                root,
+                LayoutKind::from(direction.orientation()),
+            );
+        }
+        self.tree.data.layout.set_kind(root, LayoutKind::from(direction.orientation()));
+        let node = self.add_window_under(layout, root, wid);
+        if matches!(direction, Direction::Right | Direction::Down) {
+            if let Some(first) = root.first_child(self.map()).filter(|&first| first != node) {
+                node.detach(&mut self.tree).insert_before(first);
+            }
+        }
+        self.select(node);
+    }
+
     fn replace_window(&mut self, from: WindowId, to: WindowId) {
         self.tree.data.window.replace_window(from, to);
     }
@@ -888,6 +910,23 @@ impl LayoutSystem for TraditionalLayoutSystem {
     fn move_selection(&mut self, layout: LayoutId, direction: Direction) -> bool {
         let selection = self.selection(layout);
         self.move_node(layout, selection, direction)
+    }
+
+    fn move_selection_with_display_neighbor(
+        &mut self,
+        layout: LayoutId,
+        direction: Direction,
+        has_neighbor: bool,
+    ) -> bool {
+        let selection = self.selection(layout);
+        if has_neighbor
+            && !selection
+                .ancestors(self.map())
+                .any(|node| self.move_over(node, direction).is_some())
+        {
+            return false;
+        }
+        self.move_selection(layout, direction)
     }
 
     fn move_selection_to_layout_after_selection(
@@ -1421,24 +1460,23 @@ impl TraditionalLayoutSystem {
         children: &[NodeId],
         selected_index: usize,
     ) -> crate::layout_engine::engine::GroupContainerInfo {
-        let ui_selected_index = if matches!(kind, crate::layout_engine::LayoutKind::VerticalStack) {
-            children.len().saturating_sub(1).saturating_sub(selected_index)
-        } else {
-            selected_index
-        };
-
-        let mut window_ids =
-            children.iter().filter_map(|&child| self.window_at(child)).collect::<Vec<_>>();
-        if matches!(kind, crate::layout_engine::LayoutKind::VerticalStack) {
-            window_ids.reverse();
-        }
+        // One representative per non-empty child, in child order: left to right for a
+        // horizontal stack, top to bottom for a vertical one.
+        let representatives: Vec<_> = children
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &child)| self.find_best_focus_target(child).map(|(_, wid)| (i, wid)))
+            .collect();
+        let selected_index =
+            representatives.iter().position(|(i, _)| *i == selected_index).unwrap_or(0);
+        let window_ids: Vec<_> = representatives.into_iter().map(|(_, wid)| wid).collect();
 
         crate::layout_engine::engine::GroupContainerInfo {
             node_id: node,
             container_kind: kind,
             frame: rect,
-            total_count: children.len(),
-            selected_index: ui_selected_index,
+            total_count: window_ids.len(),
+            selected_index,
             window_ids,
         }
     }
@@ -1449,9 +1487,7 @@ impl TraditionalLayoutSystem {
         screen: CGRect,
         stack_offset: f64,
         gaps: &crate::common::config::GapSettings,
-        stack_line_thickness: f64,
-        stack_line_horiz: crate::common::config::HorizontalPlacement,
-        stack_line_vert: crate::common::config::VerticalPlacement,
+        stack_line: crate::common::config::StackLineReserve,
     ) -> Vec<crate::layout_engine::engine::GroupContainerInfo> {
         use crate::layout_engine::LayoutKind::*;
 
@@ -1500,9 +1536,7 @@ impl TraditionalLayoutSystem {
                     children.len(),
                     stack_offset,
                     is_horizontal,
-                    stack_line_thickness,
-                    stack_line_horiz,
-                    stack_line_vert,
+                    stack_line,
                 );
                 rect = layout_res.get_frame_for_index(selected_index);
 
@@ -1533,9 +1567,7 @@ impl TraditionalLayoutSystem {
         screen: CGRect,
         stack_offset: f64,
         gaps: &crate::common::config::GapSettings,
-        stack_line_thickness: f64,
-        stack_line_horiz: crate::common::config::HorizontalPlacement,
-        stack_line_vert: crate::common::config::VerticalPlacement,
+        stack_line: crate::common::config::StackLineReserve,
     ) -> Vec<crate::layout_engine::engine::GroupContainerInfo> {
         use crate::layout_engine::LayoutKind::*;
 
@@ -1577,9 +1609,7 @@ impl TraditionalLayoutSystem {
                     children.len(),
                     stack_offset,
                     is_horizontal,
-                    stack_line_thickness,
-                    stack_line_horiz,
-                    stack_line_vert,
+                    stack_line,
                 );
 
                 for (i, &child) in children.iter().enumerate().rev() {
@@ -1806,7 +1836,16 @@ impl TraditionalLayoutSystem {
         if let Some(window) = self.window_at(node) {
             return Some(window);
         }
-
+        // Stacked groups present their locally selected window from every
+        // direction (mirrors descend_into_target), so cross-display focus
+        // keeps the stack's selection instead of raising a different member.
+        if self.tree.data.layout.kind(node).is_stacked() {
+            if let Some(selected) = self.tree.data.selection.local_selection(self.map(), node) {
+                if let Some(window) = self.window_in_direction_from(selected, direction) {
+                    return Some(window);
+                }
+            }
+        }
         let mut children: Vec<_> = node.children(self.map()).collect();
         match direction {
             Direction::Left | Direction::Up => children.reverse(),
@@ -2053,15 +2092,7 @@ impl TraditionalLayoutSystem {
             } else {
                 let old_root = moving_node.ancestors(map).last().unwrap();
                 if self.tree.data.layout.kind(old_root).orientation() == direction.orientation() {
-                    let is_edge_move = match direction {
-                        Direction::Left | Direction::Up => moving_node.prev_sibling(map).is_none(),
-                        Direction::Right | Direction::Down => {
-                            moving_node.next_sibling(map).is_none()
-                        }
-                    };
-                    if !is_edge_move {
-                        return false;
-                    }
+                    return false;
                 }
                 let new_container_kind = LayoutKind::from(direction.orientation());
                 self.nest_in_container_internal(layout, old_root, new_container_kind);
@@ -2773,7 +2804,7 @@ impl Layout {
         node: NodeId,
         constraints: &HashMap<WindowId, WindowLayoutConstraints>,
         stack_offset: f64,
-        stack_line_thickness: f64,
+        stack_line: crate::common::config::StackLineReserve,
         gaps: &crate::common::config::GapSettings,
         horizontal: bool,
     ) -> (f64, Option<f64>, Option<f64>, bool) {
@@ -2816,7 +2847,7 @@ impl Layout {
                 *child,
                 constraints,
                 stack_offset,
-                stack_line_thickness,
+                stack_line,
                 gaps,
                 horizontal,
             );
@@ -2828,15 +2859,7 @@ impl Layout {
         }
 
         if children.len() == 1 {
-            let reserve = if matches!(kind, LayoutKind::HorizontalStack | LayoutKind::VerticalStack)
-                && matches!(
-                    (kind, horizontal),
-                    (LayoutKind::HorizontalStack, false) | (LayoutKind::VerticalStack, true)
-                ) {
-                stack_line_thickness.max(0.0)
-            } else {
-                0.0
-            };
+            let reserve = stack_line.on_axis(kind, horizontal);
             return (
                 mins[0] + reserve,
                 fixed_parts[0].map(|value| value + reserve),
@@ -2864,14 +2887,15 @@ impl Layout {
                         Some(value) => Some(acc.max(value)),
                         None => None,
                     });
+                let reserve = stack_line.on_axis(kind, horizontal);
                 return (
-                    required_focus + stack_span,
+                    required_focus + stack_span + reserve,
                     None,
-                    max_focus.map(|value| value + stack_span),
+                    max_focus.map(|value| value + stack_span + reserve),
                     any_grow,
                 );
             }
-            let reserve = stack_line_thickness.max(0.0);
+            let reserve = stack_line.on_axis(kind, horizontal);
             let fixed_max = fixed_parts.iter().copied().try_fold(0.0, |acc, part| match part {
                 Some(value) => Some(if value > acc { value } else { acc }),
                 None => None,
@@ -2926,9 +2950,7 @@ impl Layout {
         stack_offset: f64,
         constraints: &HashMap<WindowId, WindowLayoutConstraints>,
         gaps: &crate::common::config::GapSettings,
-        stack_line_thickness: f64,
-        stack_line_horiz: crate::common::config::HorizontalPlacement,
-        stack_line_vert: crate::common::config::VerticalPlacement,
+        stack_line: crate::common::config::StackLineReserve,
     ) {
         let info = &self.info[node];
         let rect = if info.is_fullscreen {
@@ -2977,7 +2999,7 @@ impl Layout {
                         focused_child,
                         constraints,
                         stack_offset,
-                        stack_line_thickness,
+                        stack_line,
                         gaps,
                         is_horizontal,
                     );
@@ -3000,9 +3022,7 @@ impl Layout {
                     children.len(),
                     effective_stack_offset,
                     is_horizontal,
-                    stack_line_thickness,
-                    stack_line_horiz,
-                    stack_line_vert,
+                    stack_line,
                 );
                 for (idx, &child) in children.iter().enumerate() {
                     let frame = if idx == focused_idx {
@@ -3021,9 +3041,7 @@ impl Layout {
                         stack_offset,
                         constraints,
                         gaps,
-                        stack_line_thickness,
-                        stack_line_horiz,
-                        stack_line_vert,
+                        stack_line,
                     );
                 }
             }
@@ -3039,9 +3057,7 @@ impl Layout {
                 constraints,
                 gaps,
                 true,
-                stack_line_thickness,
-                stack_line_horiz,
-                stack_line_vert,
+                stack_line,
             ),
             Vertical => self.layout_axis(
                 map,
@@ -3055,9 +3071,7 @@ impl Layout {
                 constraints,
                 gaps,
                 false,
-                stack_line_thickness,
-                stack_line_horiz,
-                stack_line_vert,
+                stack_line,
             ),
         }
     }
@@ -3075,9 +3089,7 @@ impl Layout {
         constraints: &HashMap<WindowId, WindowLayoutConstraints>,
         gaps: &crate::common::config::GapSettings,
         horizontal: bool,
-        stack_line_thickness: f64,
-        stack_line_horiz: crate::common::config::HorizontalPlacement,
-        stack_line_vert: crate::common::config::VerticalPlacement,
+        stack_line: crate::common::config::StackLineReserve,
     ) {
         use objc2_core_foundation::{CGPoint, CGSize};
         let children: Vec<_> = node.children(map).collect();
@@ -3135,7 +3147,7 @@ impl Layout {
                     child,
                     constraints,
                     stack_offset,
-                    stack_line_thickness,
+                    stack_line,
                     gaps,
                     horizontal,
                 );
@@ -3193,9 +3205,7 @@ impl Layout {
                 stack_offset,
                 constraints,
                 gaps,
-                stack_line_thickness,
-                stack_line_horiz,
-                stack_line_vert,
+                stack_line,
             );
             offset += seg_len;
             if i < children.len() - 1 {
@@ -3218,45 +3228,14 @@ fn stack_layout_result(
     child_count: usize,
     stack_offset: f64,
     is_horizontal: bool,
-    stack_line_thickness: f64,
-    stack_line_horiz: crate::common::config::HorizontalPlacement,
-    stack_line_vert: crate::common::config::VerticalPlacement,
+    stack_line: crate::common::config::StackLineReserve,
 ) -> StackLayoutResult {
-    let reserve = stack_line_thickness.max(0.0);
-    let container_rect = adjust_stack_container_rect(
-        rect,
+    StackLayoutResult::new(
+        stack_line.inset(rect, is_horizontal),
+        child_count,
+        stack_offset,
         is_horizontal,
-        reserve,
-        stack_line_horiz,
-        stack_line_vert,
-    );
-    StackLayoutResult::new(container_rect, child_count, stack_offset, is_horizontal)
-}
-
-fn adjust_stack_container_rect(
-    mut container_rect: CGRect,
-    is_horizontal: bool,
-    reserve: f64,
-    stack_line_horiz: crate::common::config::HorizontalPlacement,
-    stack_line_vert: crate::common::config::VerticalPlacement,
-) -> CGRect {
-    if reserve <= 0.0 {
-        return container_rect;
-    }
-    if is_horizontal {
-        let new_h = (container_rect.size.height - reserve).max(0.0);
-        if matches!(stack_line_horiz, crate::common::config::HorizontalPlacement::Top) {
-            container_rect.origin.y += reserve;
-        }
-        container_rect.size.height = new_h;
-    } else {
-        let new_w = (container_rect.size.width - reserve).max(0.0);
-        if matches!(stack_line_vert, crate::common::config::VerticalPlacement::Left) {
-            container_rect.origin.x += reserve;
-        }
-        container_rect.size.width = new_w;
-    }
-    container_rect
+    )
 }
 
 #[cfg(test)]
@@ -3293,6 +3272,31 @@ mod tests {
 
         assert_eq!(system.window_in_direction(layout, Direction::Down), Some(w(1)));
         assert_eq!(system.window_in_direction(layout, Direction::Up), Some(w(2)));
+    }
+
+    #[test]
+    fn window_in_direction_uses_stack_selection() {
+        let mut system = TraditionalLayoutSystem::default();
+        let layout = system.create_layout();
+        let root = system.root(layout);
+        system.tree.data.layout.set_kind(root, LayoutKind::VerticalStack);
+        system.add_window_after_selection(layout, w(1));
+        system.add_window_after_selection(layout, w(2));
+        system.add_window_after_selection(layout, w(3));
+        system.select_window(layout, w(2));
+
+        for direction in [
+            Direction::Left,
+            Direction::Right,
+            Direction::Up,
+            Direction::Down,
+        ] {
+            assert_eq!(
+                system.window_in_direction(layout, direction),
+                Some(w(2)),
+                "{direction:?}"
+            );
+        }
     }
 
     struct TestTraditionalLayoutSystem {
@@ -3779,8 +3783,6 @@ mod tests {
                 0.0,
                 &HashMap::default(),
                 &Default::default(),
-                0.0,
-                Default::default(),
                 Default::default(),
             )
             .into_iter()
@@ -4003,6 +4005,76 @@ mod tests {
     }
 
     #[test]
+    fn dragging_out_of_a_stack_splits_in_the_drop_direction() {
+        for nested in [false, true] {
+            for count in [2, 3] {
+                for stack_kind in [LayoutKind::HorizontalStack, LayoutKind::VerticalStack] {
+                    for direction in [
+                        Direction::Left,
+                        Direction::Right,
+                        Direction::Up,
+                        Direction::Down,
+                    ] {
+                        let mut system = TraditionalLayoutSystem::default();
+                        let layout = system.create_layout();
+                        let root = system.root(layout);
+                        let stack = if nested {
+                            system.add_window_after_selection(layout, w(4));
+                            let stack = system.tree.mk_node().push_back(root);
+                            system.set_layout(stack, stack_kind);
+                            stack
+                        } else {
+                            system.set_layout(root, stack_kind);
+                            root
+                        };
+                        for id in 1..=count {
+                            system.add_window_under(layout, stack, w(id));
+                        }
+
+                        assert!(system.apply_window_drop(
+                            layout,
+                            w(1),
+                            w(2),
+                            crate::layout_engine::WindowDropAction::Insert(direction),
+                        ));
+                        let source = system.window_node(layout, w(1)).unwrap();
+                        let target = system.window_node(layout, w(2)).unwrap();
+                        let remaining = if count == 3 {
+                            let third = system.window_node(layout, w(3)).unwrap();
+                            let group = target.parent(system.map()).unwrap();
+                            assert_eq!(third.parent(system.map()), Some(group));
+                            assert_eq!(system.layout(group), stack_kind);
+                            group
+                        } else {
+                            target
+                        };
+                        let split = source.parent(system.map()).unwrap();
+                        assert_eq!(remaining.parent(system.map()), Some(split));
+                        assert!(!system.layout(split).is_group());
+                        assert_eq!(system.layout(split).orientation(), direction.orientation());
+                        let expected = if matches!(direction, Direction::Left | Direction::Up) {
+                            vec![source, remaining]
+                        } else {
+                            vec![remaining, source]
+                        };
+                        // A matching outer split also contains the unrelated window.
+                        let actual: Vec<_> = split
+                            .children(system.map())
+                            .filter(|node| *node == source || *node == remaining)
+                            .collect();
+                        assert_eq!(actual, expected);
+                        assert_eq!(
+                            system.all_windows_in_layout(layout).len(),
+                            count as usize + usize::from(nested)
+                        );
+                        assert_eq!(system.selection(layout), source);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn source_slot_move_can_leave_a_nested_split() {
         let mut system = TraditionalLayoutSystem::default();
         let layout = system.create_layout();
@@ -4136,8 +4208,6 @@ mod tests {
             40.0,
             &constraints,
             &Default::default(),
-            0.0,
-            Default::default(),
             Default::default(),
         );
         let frames: HashMap<WindowId, CGRect> = positions.into_iter().collect();
@@ -4198,8 +4268,6 @@ mod tests {
                 40.0,
                 &constraints,
                 &Default::default(),
-                0.0,
-                Default::default(),
                 Default::default(),
             )
             .into_iter()
@@ -4262,8 +4330,6 @@ mod tests {
                 40.0,
                 &constraints,
                 &Default::default(),
-                0.0,
-                Default::default(),
                 Default::default(),
             )
             .into_iter()
@@ -4277,8 +4343,6 @@ mod tests {
                 40.0,
                 &constraints,
                 &Default::default(),
-                0.0,
-                Default::default(),
                 Default::default(),
             )
             .into_iter()
@@ -4342,8 +4406,6 @@ mod tests {
             250.0,
             &constraints,
             &Default::default(),
-            0.0,
-            Default::default(),
             Default::default(),
         );
         let frames: HashMap<WindowId, CGRect> = frames.into_iter().collect();
@@ -4398,8 +4460,6 @@ mod tests {
             220.0,
             &constraints,
             &Default::default(),
-            0.0,
-            Default::default(),
             Default::default(),
         );
         let frames: HashMap<WindowId, CGRect> = frames.into_iter().collect();
@@ -4454,8 +4514,6 @@ mod tests {
             250.0,
             &constraints,
             &Default::default(),
-            0.0,
-            Default::default(),
             Default::default(),
         );
         let frames: HashMap<WindowId, CGRect> = frames.into_iter().collect();
@@ -4511,8 +4569,6 @@ mod tests {
                 40.0,
                 &constraints,
                 &Default::default(),
-                0.0,
-                Default::default(),
                 Default::default(),
             )
             .into_iter()
@@ -4559,8 +4615,6 @@ mod tests {
                 40.0,
                 &Default::default(),
                 &Default::default(),
-                0.0,
-                Default::default(),
                 Default::default(),
             )
             .into_iter()
@@ -4573,8 +4627,6 @@ mod tests {
                 40.0,
                 &Default::default(),
                 &Default::default(),
-                0.0,
-                Default::default(),
                 Default::default(),
             )
             .into_iter()
@@ -4624,8 +4676,6 @@ mod tests {
                 0.0,
                 &constraints,
                 &Default::default(),
-                0.0,
-                Default::default(),
                 Default::default(),
             )
             .into_iter()
@@ -4688,8 +4738,6 @@ mod tests {
                 0.0,
                 &constraints,
                 &Default::default(),
-                0.0,
-                Default::default(),
                 Default::default(),
             )
             .into_iter()
@@ -4750,8 +4798,6 @@ mod tests {
                 0.0,
                 &constraints,
                 &Default::default(),
-                0.0,
-                Default::default(),
                 Default::default(),
             )
             .into_iter()
@@ -4767,6 +4813,141 @@ mod tests {
             sibling_frame.size.width >= 879.0,
             "shared column max width should be reclaimed by the sibling split"
         );
+    }
+
+    #[test]
+    fn native_tabs_reserve_the_configured_edge_without_changing_stack_direction() {
+        use crate::common::config::{HorizontalPlacement, StackLineReserve, VerticalPlacement};
+        let rect = |x, y, w, h| CGRect::new(CGPoint::new(x, y), CGSize::new(w, h));
+        let cases = [
+            (
+                LayoutKind::HorizontalStack,
+                HorizontalPlacement::Top,
+                VerticalPlacement::Left,
+                rect(100.0, 229.0, 400.0, 271.0),
+            ),
+            (
+                LayoutKind::HorizontalStack,
+                HorizontalPlacement::Bottom,
+                VerticalPlacement::Left,
+                rect(100.0, 200.0, 400.0, 271.0),
+            ),
+            (
+                LayoutKind::VerticalStack,
+                HorizontalPlacement::Top,
+                VerticalPlacement::Left,
+                rect(129.0, 200.0, 371.0, 300.0),
+            ),
+            (
+                LayoutKind::VerticalStack,
+                HorizontalPlacement::Top,
+                VerticalPlacement::Right,
+                rect(100.0, 200.0, 371.0, 300.0),
+            ),
+        ];
+        for (kind, horiz, vert, expected) in cases {
+            let mut system = TraditionalLayoutSystem::default();
+            let layout = system.create_layout();
+            let root = system.root(layout);
+            system.tree.data.layout.set_kind(root, kind);
+            let a = w(170);
+            let b = w(171);
+            system.add_window_under(layout, root, a);
+            system.add_window_under(layout, root, b);
+            system.select_window(layout, b);
+            let screen = rect(100.0, 200.0, 400.0, 300.0);
+            let reserve = StackLineReserve {
+                thickness: 28.0,
+                spacing: 1.0,
+                horiz,
+                vert,
+            };
+            let frames = system.calculate_layout(
+                layout,
+                screen,
+                0.0,
+                &HashMap::default(),
+                &Default::default(),
+                reserve,
+            );
+            for (_, frame) in frames {
+                assert_eq!(frame, expected, "{kind:?} {horiz:?} {vert:?}");
+            }
+            // The bar sits on the reserved edge, flush with the stack's outer frame.
+            let bar = reserve.bar(screen, kind == LayoutKind::HorizontalStack);
+            let expected_bar = match (kind, horiz, vert) {
+                (LayoutKind::HorizontalStack, HorizontalPlacement::Top, _) => {
+                    rect(100.0, 200.0, 400.0, 28.0)
+                }
+                (LayoutKind::HorizontalStack, HorizontalPlacement::Bottom, _) => {
+                    rect(100.0, 472.0, 400.0, 28.0)
+                }
+                (_, _, VerticalPlacement::Left) => rect(100.0, 200.0, 28.0, 300.0),
+                (_, _, VerticalPlacement::Right) => rect(472.0, 200.0, 28.0, 300.0),
+            };
+            assert_eq!(bar, expected_bar);
+            assert_eq!(system.tree.data.layout.kind(root), kind);
+        }
+    }
+
+    #[test]
+    fn nested_stack_tabs_resolve_selected_representative_after_empty_child() {
+        let mut system = TraditionalLayoutSystem::default();
+        let layout = system.create_layout();
+        let root = system.root(layout);
+        system.tree.data.layout.set_kind(root, LayoutKind::VerticalStack);
+        let _empty = system.tree.mk_node().push_back(root);
+        let nested = system.tree.mk_node().push_back(root);
+        system.tree.data.layout.set_kind(nested, LayoutKind::Vertical);
+        let a = w(172);
+        let b = w(173);
+        let c = w(174);
+        system.add_window_under(layout, nested, a);
+        system.add_window_under(layout, nested, b);
+        system.add_window_under(layout, root, c);
+        system.select_window(layout, b);
+        let groups = system.collect_group_containers(
+            layout,
+            CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(400.0, 300.0)),
+            0.0,
+            &Default::default(),
+            crate::common::config::StackLineReserve {
+                thickness: 28.0,
+                ..Default::default()
+            },
+        );
+        let group = groups.iter().find(|g| g.node_id == root).unwrap();
+        assert_eq!(group.total_count, 2);
+        assert_eq!(group.window_ids[group.selected_index], b);
+        assert_eq!(group.window_ids, [b, c]);
+    }
+
+    #[test]
+    fn stack_bars_stay_inside_small_stacks() {
+        use crate::common::config::HorizontalPlacement::*;
+        use crate::common::config::StackLineReserve;
+        use crate::common::config::VerticalPlacement::*;
+        let small = CGRect::new(CGPoint::new(10.0, 20.0), CGSize::new(16.0, 12.0));
+        for (horiz, vert, horizontal) in [
+            (Top, Left, true),
+            (Bottom, Right, true),
+            (Top, Left, false),
+            (Bottom, Right, false),
+        ] {
+            let reserve = StackLineReserve {
+                thickness: 28.0,
+                spacing: 50.0,
+                horiz,
+                vert,
+            };
+            for f in [
+                reserve.bar(small, horizontal),
+                reserve.inset(small, horizontal),
+            ] {
+                assert!(f.origin.x >= small.origin.x && f.origin.y >= small.origin.y);
+                assert!(f.max().x <= small.max().x && f.max().y <= small.max().y, "{f:?}");
+            }
+        }
     }
 
     #[test]
@@ -4814,9 +4995,10 @@ mod tests {
                 40.0,
                 &constraints,
                 &Default::default(),
-                20.0,
-                Default::default(),
-                Default::default(),
+                crate::common::config::StackLineReserve {
+                    thickness: 20.0,
+                    ..Default::default()
+                },
             )
             .into_iter()
             .collect();
@@ -4868,9 +5050,10 @@ mod tests {
                 40.0,
                 &constraints,
                 &Default::default(),
-                20.0,
-                Default::default(),
-                Default::default(),
+                crate::common::config::StackLineReserve {
+                    thickness: 20.0,
+                    ..Default::default()
+                },
             )
             .into_iter()
             .collect();
@@ -4909,8 +5092,6 @@ mod tests {
                 40.0,
                 &Default::default(),
                 &Default::default(),
-                0.0,
-                Default::default(),
                 Default::default(),
             )
             .into_iter()
@@ -4966,8 +5147,6 @@ mod tests {
                 40.0,
                 &constraints,
                 &Default::default(),
-                0.0,
-                Default::default(),
                 Default::default(),
             )
             .into_iter()
@@ -5033,8 +5212,6 @@ mod tests {
                 40.0,
                 &constraints,
                 &Default::default(),
-                0.0,
-                Default::default(),
                 Default::default(),
             )
             .into_iter()
@@ -5048,8 +5225,6 @@ mod tests {
                 40.0,
                 &constraints,
                 &Default::default(),
-                0.0,
-                Default::default(),
                 Default::default(),
             )
             .into_iter()
@@ -5223,9 +5398,7 @@ mod tests {
             0.0,
             &HashMap::default(),
             &gaps,
-            0.0,
-            crate::common::config::HorizontalPlacement::Top,
-            crate::common::config::VerticalPlacement::Left,
+            Default::default(),
         );
 
         let after = system
@@ -5356,8 +5529,6 @@ mod tests {
                 0.0,
                 &constraints,
                 &Default::default(),
-                0.0,
-                Default::default(),
                 Default::default(),
             )
             .into_iter()
@@ -5423,8 +5594,6 @@ mod tests {
                 0.0,
                 &constraints,
                 &Default::default(),
-                0.0,
-                Default::default(),
                 Default::default(),
             )
             .into_iter()
@@ -5486,8 +5655,6 @@ mod tests {
                 0.0,
                 &constraints,
                 &Default::default(),
-                0.0,
-                Default::default(),
                 Default::default(),
             )
             .into_iter()
@@ -5537,8 +5704,6 @@ mod tests {
                 0.0,
                 &constraints,
                 &Default::default(),
-                0.0,
-                Default::default(),
                 Default::default(),
             )
             .into_iter()

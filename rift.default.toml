@@ -122,6 +122,9 @@ column_width_ratio = 0.7
 # Keep each window's current width when it enters scrolling layout (default: true).
 # Widths outside the min/max column bounds are clamped.
 preserve_window_sizes = true
+# Fill the usable width when only one scrolling column remains, including stacks.
+# Its stored width returns when another column is added. Window constraints still apply.
+expand_single_column = false
 # min_column_width_ratio / max_column_width_ratio: clamp bounds used by resize commands
 min_column_width_ratio = 0.3
 max_column_width_ratio = 0.9
@@ -139,9 +142,6 @@ alignment = "center"
 # 			(disrespects alignment setting above)
 # - "anchored": always align focused column according to `alignment`
 focus_navigation_style = "niri"
-# the scrolling layout tends to function better without animations,
-# so you can disable them if you like
-# animate = false
 
 [settings.layout.scrolling.gestures]
 # Enable horizontal scroll gestures to switch columns
@@ -199,6 +199,14 @@ vertical = 0
 # [settings.layout.gaps.per_display."11111111-2222-3333-4444-555555555555".inner]
 # horizontal = 8
 # vertical = 8
+# Enabling requires restarting Rift. Disabling on reload releases Overview resources.
+# Reload closes an open Overview; previews are optional and never request permission.
+[settings.ui.mission_control]
+# enable a niri style overview
+enabled = false
+# Include empty workspaces as navigation and drag destinations.
+show_empty_workspaces = true
+
 [settings.ui.menu_bar]
 # enable menu bar workspace indicators
 enabled = false
@@ -216,22 +224,19 @@ display_style = "layout"
 layout_folder = "~/.config/rift/layouts"
 
 [settings.ui.stack_line]
-# experimental stack line indicator (defaults to off)
-enabled = false
-# action on hover: "click" or "hover" (defaults to "hover" which is just a visual indicator)
+# native tabs beside stacked windows (defaults to on)
+enabled = true
+# action on hover: "click" or "hover" (defaults to "hover", which only highlights;
+# "click" makes hovering a tab select it, as a click would)
 hover = "hover"
-# in a horizontal stack where the line will be (top/bottom)
+# in a horizontal stack where the tabs will be (top/bottom)
 horiz_placement = "top"
-# in a vertical stack where the line will be (left/right)
+# in a vertical stack where the tabs will be (left/right)
 vert_placement = "left"
-# how thick the indicator will be (in px)
-thickness = 20.0
-# spacing between the stack line and window edges (in px)
-spacing = 1.0
-# RGBA components range from 0.0 to 1.0. Each color can be customized
-# selected_color = { r = 0.0, g = 0.5, b = 1.0, a = 1.0 }
-# unselected_color = { r = 0.8, g = 0.8, b = 0.8, a = 1.0 }
-# border_color = { r = 0.6, g = 0.6, b = 0.6, a = 1.0 }
+# how thick the tab bar will be (in points, at least 20)
+thickness = 28.0
+# spacing between the tab bar and window edges (in points)
+spacing = 0.0
 
 # Trackpad gestures
 [settings.gestures]
@@ -251,9 +256,8 @@ skip_empty = true
 fingers = 3
 # Normalized horizontal distance (0..1) to trigger swipe for NSTouch-based detection
 distance_pct = 0.08
-# Haptic feedback on commit (generic | alignment | level_change)
+# Haptic feedback on swipe
 haptics_enabled = true
-haptic_pattern = "level_change"
 
 # Mouse move and tiled-window drop behavior
 [settings.drag_drop]
@@ -410,8 +414,15 @@ comb1 = "Alt + Shift"
 # - Key values map to commands (see list below)
 
 # Commands
+# Available in [keys] and [binding_modes.*].
+# Unit commands use a string; commands with arguments use an inline table.
+# Workspace/display indices are zero-based.
 # - toggle_space_activated
 # - reload_config
+# - binding_mode = "default"|"<mode_name>"
+# - save_layout = { path = "/path/to/layout.json" }
+# - restore_layout = { path = "/path/to/layout.json", scope = "workspace"|"space", source = "saved_active_space"|"current_space" }
+#   (source is optional; defaults to "saved_active_space")
 # - next_workspace / prev_workspace
 # - next_workspace = true|false (optional skip-empty override)
 # - prev_workspace = true|false (optional skip-empty override)
@@ -431,28 +442,34 @@ comb1 = "Alt + Shift"
 # - consume_or_expel_window = "left"|"right"|"up"|"down"
 # - toggle_stack / toggle_orientation / unjoin_windows
 # - toggle_focus_floating / toggle_window_floating / toggle_fullscreen / toggle_fullscreen_within_gaps
+# - toggle_window_floating = { center = true|false, size = { w = 640, h = 480 }|"smart" }
+#   (center and size are optional)
 # - resize_window_grow / resize_window_shrink (without param, horizontal is default)
 # - resize_window_grow = "horizontal"|"vertical"|"smart"
 # - resize_window_shrink = "horizontal"|"vertical"|"smart"
-# - swap_windows = [123, 456]
+# - resize_window_by = { amount = 0.05 }
 # - exec = "command" | exec = ["cmd", "arg1", "..."]
+# - focus_display = "left"|"right"|"up"|"down"|N|"<display_uuid>"
 # - move_mouse_to_display = "left"|"right"|"up"|"down"|N|"<display_uuid>"
 # - move_window_to_display = { selector = "left"|"right"|"up"|"down"|N|"<display_uuid>", window_id = 123 }
-# - move_workspace_to_display = { selector = "left"|"right"|"up"|"down"|N|"<display_uuid>", wrap_around = true }
+# - move_workspace_to_display = { selector = "left"|"right"|"up"|"down"|N|"<display_uuid>", wrap_around = true|false }
+#   (window_id is optional for move_window_to_display; wrap_around defaults to false)
 # - close_window / close_window = { window_server_id = 123 } (optional window id)
 # - focus_window = { window_id = 123, window_server_id = 456 }
-# - show_mission_control_all / show_mission_control_current / dismiss_mission_control (this is rift's own mission control, not macOS's)
+# - show_mission_control_all / dismiss_mission_control (this is rift's own mission control, not macOS's)
 
 # To enter a resize mode, add a binding to [keys] before declaring the mode.
 # "Alt + R" = { binding_mode = "resize" }
 
 # the following commands *only* work when the master stack layout is active
-# - adjust_master_ratio = 0.05 / adjust_master_count = 1
+# - adjust_master_ratio = 0.05 / adjust_master_count = { delta = 1 }
 # - promote_to_master / swap_master_stack
 
 # the following commands *only* work when the scrolling layout is active
 # - scroll_strip = { delta = 0.5 }
 # - snap_strip / center_selection
+# - switch_preset_column_width (cycle forward)
+# - switch_preset_column_width = { backwards = true|false }
 
 "Alt + Z" = "toggle_space_activated"
 
@@ -528,9 +545,6 @@ comb1 = "Alt + Shift"
 # "Alt + Ctrl + Shift + Right" = { move_workspace_to_display = { selector = "right", wrap_around = true } }
 
 # if mission control is enabled
-# this will show an exploded view of the windows in the active workspace
-# "Alt + Ctrl + Shift + M" = "show_mission_control_current"
-# this will show the mission control view shown in the readme
 # "Alt + Ctrl + M" = "show_mission_control_all"
 
 "Alt + Enter" = { "exec" = ["/bin/bash", "-c", "open -a \"/System/Applications/Utilities/Terminal.app\""] }

@@ -6,6 +6,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use cgs::G_CONNECTION;
 use nix::libc::{RTLD_DEFAULT, dlsym};
 use objc2_app_kit::NSWindowLevel;
 use objc2_application_services::AXError;
@@ -23,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use super::geometry::{CGRectDef, CGSizeDef};
 use crate::actor::app::WindowId;
 #[cfg(test)]
-use crate::common::collections::HashMap;
+use crate::common::collections::{HashMap, HashSet};
 use crate::sys::app::pid_t;
 use crate::sys::axuielement::{AXUIElement, Error as AxError};
 use crate::sys::cg_ok;
@@ -34,10 +35,10 @@ use crate::sys::process::ProcessSerialNumber;
 use crate::sys::screen::{ScreenInfo, SpaceId};
 use crate::sys::skylight::*;
 
-static G_CONNECTION: Lazy<i32> = Lazy::new(|| unsafe { SLSMainConnectionID() });
 static LAST_WINDOWSERVER_ACTIVITY_US: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 thread_local! {
+    static TEST_FAILED_SPACE_QUERIES: RefCell<HashSet<u64>> = RefCell::new(HashSet::default());
     static TEST_SPACE_WINDOW_LIST_OVERRIDE: RefCell<Option<Vec<u32>>> = const { RefCell::new(None) };
     static TEST_SPACE_WINDOW_LIST_BY_SPACE_OVERRIDE: RefCell<HashMap<u64, Vec<u32>>> = RefCell::new(HashMap::default());
     static TEST_WINDOW_SPACE_QUERY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -655,29 +656,42 @@ fn find_window_at_point(point: &mut CGPoint, below_window_id: Option<u32>) -> Op
 
 fn is_own_window(cid: i32) -> bool { *G_CONNECTION == cid }
 
+/// Settings is Rift's only document window; its sheets are modal windows.
+/// Floating surfaces (menus/popovers) and compositor overlays are not targets.
+fn is_ignored_own_window(wid: u32, cid: i32) -> bool {
+    if !is_own_window(cid) {
+        return false;
+    }
+    let query = WindowIterator::new(&[WindowServerId::new(wid)]);
+    let tags = query
+        .as_ref()
+        .and_then(|q| q.advance())
+        .map(|w| SLSWindowTags::from_bits_retain(w.tags()));
+    !tags.is_some_and(|tags| tags.intersects(SLSWindowTags::DOCUMENT | SLSWindowTags::MODAL))
+}
+
 pub fn get_window_at_point(mut point: CGPoint) -> Option<WindowServerId> {
     let (mut wid, mut cid) = find_window_at_point(&mut point, None)?;
-    while is_own_window(cid) {
+    while is_ignored_own_window(wid, cid) {
         (wid, cid) = find_window_at_point(&mut point, Some(wid))?;
     }
     Some(WindowServerId(wid))
 }
 
-/// Returns `true` if an external application window at normal level or above
+/// Returns `true` if an application window at normal level or above
 /// occludes the given screen point.
 ///
-/// Walks down the window stack at `point`, skipping all Rift-owned CGS
-/// windows (there may be more than one at the same point), until a non-Rift
-/// window is found. Desktop/wallpaper windows sit well below
+/// Walks down the window stack at `point`, skipping Rift-owned surfaces except
+/// Settings and its sheets. Desktop/wallpaper windows sit well below
 /// `NSNormalWindowLevel` and are not considered occluders.
 pub fn is_point_occluded_by_external_window(mut point: CGPoint) -> bool {
     use objc2_app_kit::NSNormalWindowLevel;
 
     let mut hit = find_window_at_point(&mut point, None);
 
-    // Skip past any Rift-owned windows stacked at this point.
+    // Skip other Rift surfaces without looking through Settings or its sheets.
     while let Some((wid, cid)) = hit {
-        if !is_own_window(cid) {
+        if !is_ignored_own_window(wid, cid) {
             let level = window_level(wid).unwrap_or(NSWindowLevel::MIN);
             return level >= NSNormalWindowLevel;
         }
@@ -735,21 +749,36 @@ pub fn space_window_list_for_connection(
     owner: u32,
     include_minimized: bool,
 ) -> Vec<u32> {
+    try_space_window_list_for_connection(spaces, owner, include_minimized).unwrap_or_default()
+}
+
+/// None means the native query failed, not that the Space contains no windows.
+pub fn try_space_window_list_for_connection(
+    spaces: &[u64],
+    owner: u32,
+    include_minimized: bool,
+) -> Option<Vec<u32>> {
     #[cfg(test)]
     TEST_WINDOW_ORDER_QUERY_COUNT.with(|count| count.set(count.get() + 1));
+    #[cfg(test)]
+    if TEST_FAILED_SPACE_QUERIES
+        .with(|failed| spaces.iter().any(|space| failed.borrow().contains(space)))
+    {
+        return None;
+    }
     #[cfg(test)]
     if spaces.len() == 1
         && let Some(override_ids) = TEST_SPACE_WINDOW_LIST_BY_SPACE_OVERRIDE
             .with(|ids| ids.borrow().get(&spaces[0]).cloned())
     {
         let _ = (owner, include_minimized);
-        return override_ids;
+        return Some(override_ids);
     }
 
     #[cfg(test)]
     if let Some(override_ids) = TEST_SPACE_WINDOW_LIST_OVERRIDE.with(|ids| ids.borrow().clone()) {
         let _ = (spaces, owner, include_minimized);
-        return override_ids;
+        return Some(override_ids);
     }
 
     let cf_space_array = cf_array_from_u64s(spaces);
@@ -770,20 +799,18 @@ pub fn space_window_list_for_connection(
     };
 
     if window_list_ref.is_null() {
-        return Vec::new();
+        return None;
     }
 
     let expected = (unsafe { &*window_list_ref }).len() as i32;
     if expected == 0 {
         unsafe { CFRelease(window_list_ref as *mut CFType) };
-        return Vec::new();
+        return Some(Vec::new());
     }
 
     let iterator = WindowIterator::new_from_cfarray(window_list_ref, 0);
     unsafe { CFRelease(window_list_ref as *mut CFType) };
-    let Some(iterator) = iterator else {
-        return Vec::new();
-    };
+    let iterator = iterator?;
 
     let mut windows = Vec::with_capacity(expected as usize);
 
@@ -800,7 +827,7 @@ pub fn space_window_list_for_connection(
         }
     }
 
-    windows
+    Some(windows)
 }
 
 /// Resolve the actual key window on `space` from WindowServer state.
@@ -932,7 +959,7 @@ pub fn make_key_window(pid: pid_t, wsid: WindowServerId) -> Result<(), CGError> 
 }
 
 pub fn allow_hide_mouse() -> Result<(), CGError> {
-    let cid = unsafe { SLSMainConnectionID() };
+    let cid = cgs::main_connection();
     let property = CFString::from_str("SetsCursorInBackground");
     let value = CFBoolean::retain(unsafe { kCFBooleanTrue.unwrap_unchecked() });
 
@@ -972,4 +999,15 @@ pub fn window_space_query_count() -> usize {
 #[cfg(test)]
 pub fn window_order_query_count() -> usize {
     TEST_WINDOW_ORDER_QUERY_COUNT.with(|count| count.get())
+}
+
+#[cfg(test)]
+pub fn set_space_membership_query_failed(space: u64, failed: bool) {
+    TEST_FAILED_SPACE_QUERIES.with(|spaces| {
+        if failed {
+            spaces.borrow_mut().insert(space);
+        } else {
+            spaces.borrow_mut().remove(&space);
+        }
+    });
 }

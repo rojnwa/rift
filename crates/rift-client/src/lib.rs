@@ -8,9 +8,11 @@
 #[cfg(not(target_os = "macos"))]
 compile_error!("rift-client only supports macOS");
 
+use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::mem::{MaybeUninit, size_of};
 use std::ptr::{addr_of_mut, copy_nonoverlapping};
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
@@ -30,8 +32,10 @@ type MachMessageOption = u32;
 const KERN_SUCCESS: KernReturn = 0;
 const MACH_SEND_MSG: MachMessageOption = 0x0000_0001;
 const MACH_RCV_MSG: MachMessageOption = 0x0000_0002;
+const MACH_SEND_TIMEOUT: MachMessageOption = 0x0000_0010;
 const MACH_RCV_TIMEOUT: MachMessageOption = 0x0000_0100;
 const MACH_RCV_TIMED_OUT: KernReturn = 0x1000_4003;
+// The config worker can wait five seconds for disk I/O; leave time for its error reply.
 const REQUEST_TIMEOUT_MS: u32 = 10_000;
 const MACH_MSG_TYPE_COPY_SEND: u32 = 19;
 const MACH_MSG_TYPE_MAKE_SEND: u32 = 20;
@@ -104,13 +108,13 @@ impl RiftMachClient {
         service_port.is_some()
     }
 
-    /// Sends one request and blocks until Rift responds.
+    /// Sends one request with a ten-second limit on each send and reply wait.
     pub fn send_request(&self, request: &RiftRequest) -> Result<JsonRiftResponse, ClientError> {
         self.send_typed_request(request)
     }
 
     /// Sends one request and decodes its response payload into caller-provided
-    /// types.
+    /// types. Sending and waiting for the reply each time out after ten seconds.
     pub fn send_typed_request<T: DeserializeOwned>(
         &self,
         request: &RiftRequest,
@@ -240,17 +244,54 @@ impl RiftMachClient {
 
     /// Subscribes to an event and returns a handle that blocks for future events.
     pub fn subscribe(&self, event: EventKind) -> Result<RiftMachSubscription, ClientError> {
-        let reply_port = ReplyPort::allocate(MACH_PORT_QLIMIT_LARGE)?;
-        let request = RiftRequest::Subscribe { event };
-        let request_json = serde_json::to_vec(&request).map_err(ClientError::Encode)?;
-        let response = unsafe { send_request(&request_json, Some(reply_port.name))? };
+        self.start_subscription::<Value>(RiftRequest::Subscribe { event })
+            .map(|(_, subscription)| subscription)
+    }
 
-        match parse_json_payload::<RiftResponse>(&response, "response")? {
-            RiftResponse::Success { .. } => Ok(RiftMachSubscription { reply_port }),
-            RiftResponse::Error { error } => Err(ClientError::SubscriptionRejected(error)),
-            _ => Err(ClientError::SubscriptionRejected(Value::String(
-                "Rift returned an unknown response shape".to_owned(),
-            ))),
+    /// Returns the initial editable source and a configuration-change subscription
+    /// in one round trip. Changes racing the snapshot are retained for `recv_event`.
+    pub fn initialize_settings<T: DeserializeOwned>(
+        &self,
+    ) -> Result<(T, RiftMachSubscription), ClientError> {
+        self.start_subscription(RiftRequest::InitializeSettings)
+    }
+
+    fn start_subscription<T: DeserializeOwned>(
+        &self,
+        request: RiftRequest,
+    ) -> Result<(T, RiftMachSubscription), ClientError> {
+        let reply_port = ReplyPort::allocate(MACH_PORT_QLIMIT_LARGE)?;
+        let request_json = serde_json::to_vec(&request).map_err(ClientError::Encode)?;
+        let deadline = std::time::Instant::now() + Duration::from_millis(REQUEST_TIMEOUT_MS.into());
+        let mut payload = unsafe { send_request(&request_json, Some(reply_port.name))? };
+        let mut pending = VecDeque::new();
+        loop {
+            let value: Value = parse_json_payload(&payload, "response")?;
+            // Broadcasts and the reply share a receive port. The event dispatcher
+            // can win the race with the config worker, including for ordinary subscribe.
+            if value.get("type").is_some() {
+                pending.push_back(payload);
+                if std::time::Instant::now() >= deadline {
+                    return Err(ClientError::Mach {
+                        operation: "subscription initialization",
+                        code: MACH_RCV_TIMED_OUT,
+                    });
+                }
+                let timeout = deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_millis()
+                    .min(u32::MAX.into()) as u32;
+                payload = unsafe { receive_message(reply_port.name, Some(timeout))? };
+                continue;
+            }
+            return match parse_json_payload::<RiftResponse<T>>(&payload, "response")? {
+                RiftResponse::Success { data } => Ok((data, RiftMachSubscription {
+                    reply_port,
+                    pending: Mutex::new(pending),
+                })),
+                RiftResponse::Error { error } => Err(ClientError::SubscriptionRejected(error)),
+                _ => Err(ClientError::UnknownResponse),
+            };
         }
     }
 
@@ -314,6 +355,7 @@ impl WindowManagementSession {
 #[derive(Debug)]
 pub struct RiftMachSubscription {
     reply_port: ReplyPort,
+    pending: Mutex<VecDeque<Vec<u8>>>,
 }
 
 impl RiftMachSubscription {
@@ -329,7 +371,11 @@ impl RiftMachSubscription {
     /// Blocks until the next event arrives and decodes it into the requested
     /// type.
     pub fn recv_event_as<T: DeserializeOwned>(&self) -> Result<T, ClientError> {
-        let payload = unsafe { receive_message(self.reply_port.name, None)? };
+        let pending = self.pending.lock().expect("subscription pending events").pop_front();
+        let payload = match pending {
+            Some(payload) => payload,
+            None => unsafe { receive_message(self.reply_port.name, None)? },
+        };
         parse_json_payload(&payload, "event")
     }
 }
@@ -585,7 +631,17 @@ unsafe fn send_request(
     let header_ptr = unsafe { prepare_inline_send(&mut storage, header, payload) };
     let send_size = unsafe { (*header_ptr).size };
 
-    let result = unsafe { mach_msg(header_ptr, MACH_SEND_MSG, send_size, 0, 0, 0, 0) };
+    let result = unsafe {
+        mach_msg(
+            header_ptr,
+            MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+            send_size,
+            0,
+            0,
+            REQUEST_TIMEOUT_MS,
+            0,
+        )
+    };
     if result != KERN_SUCCESS {
         return Err(ClientError::Mach {
             operation: "mach_msg(send)",
@@ -598,7 +654,7 @@ unsafe fn send_request(
 
 unsafe fn receive_message(
     reply_port: MachPort,
-    timeout_ms: Option<u32>,
+    timeout: Option<u32>,
 ) -> Result<Vec<u8>, ClientError> {
     // The kernel initializes the received header, payload, and trailer. Leave
     // the maximum-sized backing storage untouched until then.
@@ -609,7 +665,7 @@ unsafe fn receive_message(
         mach_msg(
             header_ptr,
             MACH_RCV_MSG
-                | if timeout_ms.is_some() {
+                | if timeout.is_some() {
                     MACH_RCV_TIMEOUT
                 } else {
                     0
@@ -617,7 +673,7 @@ unsafe fn receive_message(
             0,
             size_of::<ReceiveBuffer>() as u32,
             reply_port,
-            timeout_ms.unwrap_or(0),
+            timeout.unwrap_or(0),
             0,
         )
     };

@@ -70,6 +70,7 @@ pub(crate) struct EventOutcome {
     pub(crate) make_key_windows: Vec<(pid_t, WindowServerId)>,
     pub(crate) mouse_warps: Vec<CGPoint>,
     pub(crate) post_arrange_mouse_warp: Option<WindowId>,
+    pub(crate) drop_haptic: bool,
     pub(crate) pre_layout_window_frame_writes: Vec<WindowFrameWriteRequest>,
     pub(crate) interactive_window_frame_write: Option<WindowFrameWriteRequest>,
     pub(crate) dispatch_mouse_up: bool,
@@ -92,10 +93,12 @@ pub(crate) struct EventOutcome {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct ArrangeRequest {
+    /// Zero or one: arrange the final model, regardless of how many reducers requested it.
     pub(crate) passes: u8,
     pub(crate) is_resize: bool,
     pub(crate) window_was_destroyed: bool,
     pub(crate) space_scope: Option<SpaceId>,
+    pub(crate) secondary_space_scope: Option<SpaceId>,
 }
 
 impl EventOutcome {
@@ -121,6 +124,7 @@ impl EventOutcome {
         self.raise_requests.append(&mut other.raise_requests);
         self.make_key_windows.append(&mut other.make_key_windows);
         self.mouse_warps.append(&mut other.mouse_warps);
+        self.drop_haptic |= other.drop_haptic;
         self.post_arrange_mouse_warp =
             other.post_arrange_mouse_warp.or(self.post_arrange_mouse_warp);
         if !other.pre_layout_window_frame_writes.is_empty()
@@ -147,15 +151,16 @@ impl EventOutcome {
         self.layout_events.append(&mut other.layout_events);
         self.layout_responses.append(&mut other.layout_responses);
         if other.arrange.passes > 0 {
-            self.arrange.space_scope = if self.arrange.passes > 0 {
-                match (self.arrange.space_scope, other.arrange.space_scope) {
-                    (Some(existing), Some(other)) if existing == other => Some(existing),
-                    _ => None,
-                }
-            } else {
-                other.arrange.space_scope
-            };
-            self.arrange.passes = self.arrange.passes.saturating_add(other.arrange.passes).max(1);
+            if self.arrange.passes == 0 {
+                self.arrange.space_scope = other.arrange.space_scope;
+                self.arrange.secondary_space_scope = other.arrange.secondary_space_scope;
+            } else if (self.arrange.space_scope, self.arrange.secondary_space_scope)
+                != (other.arrange.space_scope, other.arrange.secondary_space_scope)
+            {
+                self.arrange.space_scope = None;
+                self.arrange.secondary_space_scope = None;
+            }
+            self.arrange.passes = 1;
             self.arrange.is_resize |= other.arrange.is_resize;
             self.arrange.window_was_destroyed |= other.arrange.window_was_destroyed;
         }
@@ -173,6 +178,7 @@ impl EventOutcome {
                 is_resize,
                 window_was_destroyed: false,
                 space_scope: None,
+                secondary_space_scope: None,
             },
             refresh_layout_mode: true,
             ..Self::default()
@@ -239,7 +245,7 @@ impl EventOutcome {
     }
 
     pub(crate) fn with_arrange_passes(mut self, passes: u8) -> Self {
-        self.arrange.passes = passes;
+        self.arrange.passes = u8::from(passes > 0);
         self
     }
 
@@ -398,11 +404,13 @@ mod tests {
             EventOutcome::layout_changed(false).with_arrange_space_scope(Some(first_space)),
         );
         assert_eq!(outcome.arrange.space_scope, Some(first_space));
+        assert_eq!(outcome.arrange.passes, 1);
 
         outcome.absorb(
             EventOutcome::layout_changed(false).with_arrange_space_scope(Some(second_space)),
         );
         assert_eq!(outcome.arrange.space_scope, None);
+        assert_eq!(outcome.arrange.passes, 1);
     }
 
     #[test]
@@ -418,6 +426,19 @@ mod tests {
         assert_eq!(outcome.arrange.passes, 1);
         assert_eq!(outcome.arrange.space_scope, Some(space));
         assert!(!outcome.arrange.is_resize);
+    }
+
+    #[test]
+    fn absorbed_arrange_requests_preserve_resize_and_destruction_intent() {
+        let mut outcome = EventOutcome::no_change();
+        assert_eq!(outcome.arrange.passes, 0);
+        outcome.absorb(EventOutcome::no_change());
+        assert_eq!(outcome.arrange.passes, 0);
+        outcome.absorb(EventOutcome::layout_changed(true));
+        outcome.absorb(EventOutcome::window_membership_changed(true, false));
+        assert_eq!(outcome.arrange.passes, 1);
+        assert!(outcome.arrange.is_resize);
+        assert!(outcome.arrange.window_was_destroyed);
     }
 
     #[test]

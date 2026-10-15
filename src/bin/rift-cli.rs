@@ -30,6 +30,8 @@ enum CliCommand {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Open Rift’s native Settings window
+    Settings,
     /// Query information from rift
     Query {
         #[command(subcommand)]
@@ -118,6 +120,8 @@ enum QueryCommands {
 
 #[derive(Subcommand)]
 enum ExecuteCommands {
+    /// Switch to a configured binding mode (use default to reset)
+    BindingMode { mode: String },
     /// Window management commands
     Window {
         #[command(subcommand)]
@@ -345,6 +349,11 @@ enum LayoutCommands {
     ScrollStrip { delta: f64 },
     /// Snap the strip to the nearest column boundary (scrolling layout only)
     SnapStrip,
+    /// Switch to the next preset column width (scrolling layout only).
+    SwitchPresetColumnWidth {
+        #[arg(long)]
+        backwards: bool,
+    },
     /// Toggle centering of the selected column in scrolling layout.
     /// If invoked again on the same selection, centering is removed.
     CenterSelection,
@@ -501,12 +510,12 @@ enum DisplayCommands {
 enum SubscribeCommands {
     /// Subscribe to Mach IPC events
     Mach {
-        /// Event to subscribe to (workspace_changed, windows_changed, window_title_changed, focused_window_changed, stacks_changed, layout_changed, selection_changed, binding_mode_changed, *)
+        /// Event to subscribe to (workspace_changed, windows_changed, window_title_changed, focused_window_changed, stacks_changed, layout_changed, selection_changed, binding_mode_changed, config_changed, *)
         event: String,
     },
     /// Subscribe to events via CLI command execution
     Cli {
-        /// Event to subscribe to (workspace_changed, windows_changed, window_title_changed, focused_window_changed, stacks_changed, layout_changed, selection_changed, binding_mode_changed, *)
+        /// Event to subscribe to (workspace_changed, windows_changed, window_title_changed, focused_window_changed, stacks_changed, layout_changed, selection_changed, binding_mode_changed, config_changed, *)
         #[arg(long)]
         event: String,
         /// Command to execute when event occurs
@@ -602,6 +611,9 @@ fn main() {
 
 fn build_request(command: Commands) -> Result<RiftRequest, String> {
     match command {
+        Commands::Settings => Ok(RiftRequest::ExecuteCommand {
+            command: rift_protocol::RiftCommand::Reactor(reactor::ReactorCommand::OpenSettings),
+        }),
         Commands::Query { query } => build_query_request(query),
         Commands::Execute { command } => build_execute_request(command),
         Commands::Subscribe { subscribe } => build_subscribe_request(subscribe),
@@ -677,6 +689,9 @@ fn build_subscribe_request(sub: SubscribeCommands) -> Result<RiftRequest, String
 
 fn build_execute_request(execute: ExecuteCommands) -> Result<RiftRequest, String> {
     let rift_command = match execute {
+        ExecuteCommands::BindingMode { mode } => CliCommand::Reactor(reactor::Command::Reactor(
+            reactor::ReactorCommand::BindingMode(mode),
+        )),
         ExecuteCommands::Window { window_cmd } => map_window_command(window_cmd)?,
         ExecuteCommands::Workspace { workspace_cmd } => map_workspace_command(workspace_cmd)?,
         ExecuteCommands::Layout { layout_cmd } => map_layout_command(layout_cmd)?,
@@ -886,10 +901,11 @@ fn parse_event_kind(input: &str) -> Result<EventKind, String> {
         "stacks_changed" => Ok(EventKind::StacksChanged),
         "layout_changed" => Ok(EventKind::LayoutChanged),
         "binding_mode_changed" => Ok(EventKind::BindingModeChanged),
+        "config_changed" => Ok(EventKind::ConfigChanged),
         "selection_changed" => Ok(EventKind::SelectionChanged),
         "*" => Ok(EventKind::All),
         other => Err(format!(
-            "Invalid event '{}'; expected workspace_changed, windows_changed, window_title_changed, focused_window_changed, stacks_changed, layout_changed, selection_changed, binding_mode_changed, or *",
+            "Invalid event '{}'; expected workspace_changed, windows_changed, window_title_changed, focused_window_changed, stacks_changed, layout_changed, selection_changed, binding_mode_changed, config_changed, or *",
             other
         )),
     }
@@ -997,6 +1013,9 @@ fn map_layout_command(cmd: LayoutCommands) -> Result<CliCommand, String> {
         LayoutCommands::SnapStrip => {
             Ok(CliCommand::Reactor(reactor::Command::Layout(LC::SnapStrip)))
         }
+        LayoutCommands::SwitchPresetColumnWidth { backwards } => Ok(CliCommand::Reactor(
+            reactor::Command::Layout(LC::SwitchPresetColumnWidth { backwards }),
+        )),
         LayoutCommands::CenterSelection => Ok(CliCommand::Reactor(reactor::Command::Layout(
             LC::CenterSelection,
         ))),

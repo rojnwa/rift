@@ -15,6 +15,8 @@ use crate::sys::window_server::WindowServerId;
 /// `rift_protocol::WorkspaceData` representation.
 #[derive(Debug, Clone)]
 pub struct RuntimeWorkspaceData {
+    pub workspace_id: crate::model::VirtualWorkspaceId,
+    pub space: SpaceId,
     pub id: String,
     pub index: usize,
     pub name: String,
@@ -26,6 +28,8 @@ pub struct RuntimeWorkspaceData {
 
 #[derive(Debug, Clone)]
 pub struct RuntimeWindowData {
+    /// Unparked layout geometry for presentation; info.frame keeps its existing native semantics.
+    pub layout_frame: Option<objc2_core_foundation::CGRect>,
     pub id: WindowId,
     pub is_floating: bool,
     pub externally_managed: bool,
@@ -38,13 +42,15 @@ pub struct RuntimeWindowData {
 #[derive(Debug, Clone)]
 pub struct RuntimeDisplayData {
     pub info: ScreenInfo,
-    /// True if this display's space is active per the activation policy.
+    /// True if macOS reports this display's current space as visible, even when Rift is disabled.
+    pub is_visible_space: bool,
+    /// True if this display's current space is enabled for Rift management.
     pub is_active_space: bool,
     /// True if this display corresponds to the context Rift uses when no space_id is provided
     pub is_active_context: bool,
-    /// Active space ids for this display (empty if none).
+    /// Visible space ids enabled for Rift management on this display (empty if none).
     pub active_space_ids: Vec<u64>,
-    /// Inactive space ids for this display (empty if none).
+    /// Space ids not currently managed: hidden spaces and visible spaces with Rift disabled.
     pub inactive_space_ids: Vec<u64>,
 }
 
@@ -108,7 +114,9 @@ impl From<RuntimeDisplayData> for protocol::DisplayData {
             name: value.info.name,
             screen_id: value.info.id.as_u32(),
             frame: protocol_rect(value.info.frame),
+            backing_scale: value.info.backing_scale,
             space: value.info.space.map(|space| space.get()),
+            is_visible_space: value.is_visible_space,
             is_active_space: value.is_active_space,
             is_active_context: value.is_active_context,
             active_space_ids: value.active_space_ids,
@@ -175,6 +183,7 @@ impl<'de> Deserialize<'de> for RuntimeWindowData {
 
         let helper = WindowDataDe::deserialize(deserializer)?;
         let info = WindowInfo {
+            has_native_tabs: false,
             is_standard: true,
             is_root: true,
             is_minimized: false,
@@ -191,6 +200,7 @@ impl<'de> Deserialize<'de> for RuntimeWindowData {
         };
 
         Ok(RuntimeWindowData {
+            layout_frame: None,
             id: helper.id,
             is_floating: helper.is_floating,
             externally_managed: helper.externally_managed,
@@ -214,6 +224,7 @@ impl Serialize for RuntimeDisplayData {
             #[serde_as(as = "CGRectDef")]
             frame: &'a objc2_core_foundation::CGRect,
             space: Option<u64>,
+            is_visible_space: bool,
             is_active_space: bool,
             is_active_context: bool,
             active_space_ids: &'a [u64],
@@ -226,6 +237,7 @@ impl Serialize for RuntimeDisplayData {
             screen_id: self.info.id.as_u32(),
             frame: &self.info.frame,
             space: self.info.space.map(|s| s.get()),
+            is_visible_space: self.is_visible_space,
             is_active_space: self.is_active_space,
             is_active_context: self.is_active_context,
             active_space_ids: &self.active_space_ids,
@@ -248,6 +260,8 @@ impl<'de> Deserialize<'de> for RuntimeDisplayData {
             #[serde_as(as = "CGRectDef")]
             frame: objc2_core_foundation::CGRect,
             space: Option<u64>,
+            #[serde(default)]
+            is_visible_space: bool,
             is_active_space: bool,
             is_active_context: bool,
             active_space_ids: Vec<u64>,
@@ -256,6 +270,7 @@ impl<'de> Deserialize<'de> for RuntimeDisplayData {
 
         let helper = DisplayDataDe::deserialize(deserializer)?;
         let info = ScreenInfo {
+            backing_scale: 1.0,
             id: ScreenId::new(helper.screen_id),
             frame: helper.frame,
             display_uuid: helper.uuid,
@@ -265,6 +280,7 @@ impl<'de> Deserialize<'de> for RuntimeDisplayData {
 
         Ok(RuntimeDisplayData {
             info,
+            is_visible_space: helper.is_visible_space,
             is_active_space: helper.is_active_space,
             is_active_context: helper.is_active_context,
             active_space_ids: helper.active_space_ids,
@@ -283,6 +299,7 @@ mod tests {
     #[test]
     fn window_data_serializes_with_legacy_shape() {
         let info = WindowInfo {
+            has_native_tabs: false,
             is_standard: true,
             is_root: true,
             is_minimized: false,
@@ -298,6 +315,7 @@ mod tests {
             ax_subrole: None,
         };
         let data = RuntimeWindowData {
+            layout_frame: None,
             id: WindowId::new(123, 7),
             is_floating: true,
             externally_managed: false,
@@ -330,6 +348,7 @@ mod tests {
     #[test]
     fn display_data_serializes_with_legacy_shape() {
         let info = ScreenInfo {
+            backing_scale: 1.0,
             id: ScreenId::new(7),
             frame: CGRect::new(CGPoint::new(10.0, 20.0), CGSize::new(300.0, 400.0)),
             display_uuid: "display-uuid".to_string(),
@@ -338,6 +357,7 @@ mod tests {
         };
         let data = RuntimeDisplayData {
             info,
+            is_visible_space: true,
             is_active_space: true,
             is_active_context: false,
             active_space_ids: vec![42],
@@ -351,6 +371,7 @@ mod tests {
             "screen_id": 7,
             "frame": { "origin": { "x": 10.0, "y": 20.0 }, "size": { "width": 300.0, "height": 400.0 } },
             "space": 42,
+            "is_visible_space": true,
             "is_active_space": true,
             "is_active_context": false,
             "active_space_ids": [42],
