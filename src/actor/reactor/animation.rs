@@ -1005,6 +1005,9 @@ impl AnimationManager {
         let mut any_frame_changed = camera;
 
         for &(wid, target_frame) in layout {
+            if !reactor.state.windows.is_admitted(wid) {
+                continue;
+            }
             if presented.contains(&wid) {
                 anim.mark_handled(wid);
                 continue;
@@ -1135,6 +1138,9 @@ impl AnimationManager {
         let mut any_frame_changed = false;
 
         for &(wid, target_frame) in layout {
+            if !reactor.state.windows.is_admitted(wid) {
+                continue;
+            }
             if skip_wid == Some(wid) {
                 trace!(?wid, "Skipping layout update for window currently being dragged");
                 continue;

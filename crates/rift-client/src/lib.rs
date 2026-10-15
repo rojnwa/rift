@@ -31,8 +31,9 @@ type MachMessageOption = u32;
 
 const KERN_SUCCESS: KernReturn = 0;
 const MACH_SEND_MSG: MachMessageOption = 0x0000_0001;
-const MACH_RCV_MSG: MachMessageOption = 0x0000_0002;
 const MACH_SEND_TIMEOUT: MachMessageOption = 0x0000_0010;
+const MACH_SEND_TIMED_OUT: KernReturn = 0x1000_0004;
+const MACH_RCV_MSG: MachMessageOption = 0x0000_0002;
 const MACH_RCV_TIMEOUT: MachMessageOption = 0x0000_0100;
 const MACH_RCV_TIMED_OUT: KernReturn = 0x1000_4003;
 // The config worker can wait five seconds for disk I/O; leave time for its error reply.
@@ -49,7 +50,7 @@ const TASK_BOOTSTRAP_PORT: c_int = 4;
 pub enum ClientError {
     #[error("Rift's Mach service is not registered")]
     ServiceUnavailable,
-    #[error("Rift did not respond to the request within 10 seconds")]
+    #[error("Rift request timed out after 10 seconds")]
     RequestTimedOut,
     #[error("invalid Mach service name")]
     InvalidServiceName,
@@ -577,6 +578,7 @@ unsafe fn lookup_service(name: &CStr) -> Result<MachPort, ClientError> {
 
     let mut service_port = 0;
     let result = unsafe { bootstrap_look_up(bootstrap_port, name.as_ptr(), &mut service_port) };
+    let _ = unsafe { mach_port_deallocate(mach_task_self(), bootstrap_port) };
     if result != KERN_SUCCESS {
         return Err(ClientError::ServiceUnavailable);
     }
@@ -642,6 +644,9 @@ unsafe fn send_request(
             0,
         )
     };
+    if result == MACH_SEND_TIMED_OUT {
+        return Err(ClientError::RequestTimedOut);
+    }
     if result != KERN_SUCCESS {
         return Err(ClientError::Mach {
             operation: "mach_msg(send)",

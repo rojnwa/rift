@@ -240,13 +240,13 @@ impl WindowStore {
         true
     }
 
-    pub(crate) fn windows_owned_by(&self, manager: ExternalManagerId) -> Vec<WindowId> {
-        self.windows
-            .iter()
-            .filter_map(|(&id, record)| {
-                (record.state.is_some() && record.external_manager() == Some(manager)).then_some(id)
-            })
-            .collect()
+    pub(crate) fn windows_owned_by(
+        &self,
+        manager: ExternalManagerId,
+    ) -> impl Iterator<Item = WindowId> + '_ {
+        self.windows.iter().filter_map(move |(&id, record)| {
+            (record.state.is_some() && record.external_manager() == Some(manager)).then_some(id)
+        })
     }
 
     /// Direct topology, live membership, and pending moves have different authority.
