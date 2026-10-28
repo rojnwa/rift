@@ -25,6 +25,7 @@ pub struct Workspace {
     pub is_active: bool,
     pub window_count: usize,
     pub windows: Vec<CGRect>,
+    pub has_fullscreen: bool,
 }
 
 /// Menu-bar-only projection; workspace indices remain local to each space.
@@ -54,6 +55,7 @@ impl Update {
 
 pub enum Event {
     OpenSettings,
+    BindingModeChanged(String),
     Update(Update),
     ConfigUpdated(Box<Config>),
 }
@@ -74,6 +76,7 @@ pub struct Menu {
     config_path: std::path::PathBuf,
     last_signature: Option<u64>,
     last_update: Option<Update>,
+    binding_mode: String,
 }
 
 pub type Sender = actor::Sender<Event>;
@@ -118,6 +121,7 @@ impl Menu {
             config_path,
             last_signature: None,
             last_update: None,
+            binding_mode: "default".into(),
         }
     }
 
@@ -160,6 +164,16 @@ impl Menu {
                                 Event::Update(update) => {
                                     pending = Some(update);
                                     debounce.set_next_fire(DEBOUNCE);
+                                }
+                                Event::BindingModeChanged(mode) => {
+                                    self.binding_mode = mode;
+                                    if let (Some(icon), Some(update)) = (&mut self.icon, &self.last_update) {
+                                        icon.update_status_icon(
+                                            &update.displays,
+                                            &self.config.settings.ui.menu_bar,
+                                            &self.binding_mode,
+                                        );
+                                    }
                                 }
                                 Event::ConfigUpdated(cfg) => self.handle_config_updated(*cfg),
                                 Event::OpenSettings => self.open_settings(),
@@ -229,7 +243,11 @@ impl Menu {
 
         icon.sync_workspace_topology(update.context_workspaces(), &self.config.keys);
         icon.update_menu_state(update.active_space_is_activated, update.context_workspaces());
-        icon.update_status_icon(&update.displays, &self.config.settings.ui.menu_bar);
+        icon.update_status_icon(
+            &update.displays,
+            &self.config.settings.ui.menu_bar,
+            &self.binding_mode,
+        );
     }
 
     fn handle_config_updated(&mut self, new_config: Config) {
@@ -368,6 +386,7 @@ pub(crate) fn sig(update: &Update) -> u64 {
             workspace.layout_mode.hash(&mut hash);
             workspace.is_active.hash(&mut hash);
             workspace.window_count.hash(&mut hash);
+            workspace.has_fullscreen.hash(&mut hash);
             workspace.windows.len().hash(&mut hash);
             for window in &workspace.windows {
                 let frame = *window;
@@ -397,6 +416,7 @@ mod tests {
             is_active: true,
             window_count: 1,
             windows: Vec::new(),
+            has_fullscreen: false,
         }
     }
 
@@ -448,5 +468,14 @@ mod tests {
         let after = sig(&update(changed));
 
         assert_ne!(before, after);
+    }
+
+    #[test]
+    fn signature_changes_when_workspace_fullscreen_changes() {
+        let base = vec![workspace("bsp")];
+        let mut changed = base.clone();
+        changed[0].has_fullscreen = true;
+
+        assert_ne!(sig(&update(base)), sig(&update(changed)));
     }
 }

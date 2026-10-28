@@ -16,7 +16,8 @@ use objc2_app_kit::{
     NSFontAttributeName, NSFontWeightBold, NSFontWeightMedium, NSMenuItem, NSSavePanel, NSView,
 };
 use objc2_core_foundation::{
-    CFAttributedString, CFDictionary, CFRetained, CFString, CGFloat, CGPoint, CGRect, CGSize,
+    CFAttributedString, CFDictionary, CFRetained, CFString, CGAffineTransform, CGFloat, CGPoint,
+    CGRect, CGSize,
 };
 use objc2_core_graphics::{CGBlendMode, CGContext};
 use objc2_core_text::{CTLine, kCTForegroundColorFromContextAttributeName};
@@ -107,6 +108,7 @@ pub struct MenuIcon {
     mtm: MainThreadMarker,
     prev_width: f64,
     render_key: Option<MenuIconRenderKey>,
+    rendered_binding_mode: String,
 }
 
 struct WorkspaceMenuItem {
@@ -174,6 +176,7 @@ impl MenuIcon {
             mtm,
             prev_width: 0.0,
             render_key: None,
+            rendered_binding_mode: String::new(),
         };
         this.menu_handler.set_layout_folder(layout_folder.to_path_buf());
         this.refresh_layout_library();
@@ -295,7 +298,13 @@ impl MenuIcon {
         &mut self,
         displays: &[DisplayWorkspaces],
         settings: &MenuBarSettings,
+        binding_mode: &str,
     ) {
+        let binding_mode = if settings.show_binding_mode && binding_mode != "default" {
+            binding_mode
+        } else {
+            ""
+        };
         let render_inputs = render_inputs(displays, settings);
         let render_changed =
             self.render_key.as_ref().is_none_or(|key| !key.matches_inputs(&render_inputs));
@@ -311,8 +320,16 @@ impl MenuIcon {
             return;
         }
 
-        if render_changed {
-            let layout = { build_layout(&render_inputs, self.view.text_attrs.as_ref()) };
+        if render_changed || self.rendered_binding_mode != binding_mode {
+            let mut layout = build_layout(&render_inputs, self.view.text_attrs.as_ref());
+            if let Some(line) = build_cached_text_line(binding_mode, self.view.text_attrs.as_ref())
+            {
+                let x = layout.size.width + SEPARATOR_SPACING;
+                layout.size.width = x + line.width;
+                layout.binding_mode = Some((x, line));
+            }
+            self.rendered_binding_mode.clear();
+            self.rendered_binding_mode.push_str(binding_mode);
             self.view.set_layout(layout);
             self.render_key = Some(MenuIconRenderKey::from_inputs(&render_inputs));
         }
@@ -353,6 +370,7 @@ struct MenuIconLayout {
     workspaces: Vec<WorkspaceRenderData>,
     separators: Vec<f64>,
     separator_line: Option<CachedTextLine>,
+    binding_mode: Option<(f64, CachedTextLine)>,
 }
 
 struct WorkspaceRenderData {
@@ -360,6 +378,7 @@ struct WorkspaceRenderData {
     fill_alpha: f64,
     windows: Vec<CGRect>,
     label_line: Option<CachedTextLine>,
+    fullscreen_brackets: bool,
 }
 
 struct WorkspaceRenderInput<'a> {
@@ -367,6 +386,7 @@ struct WorkspaceRenderInput<'a> {
     space: SpaceId,
     workspace: &'a Workspace,
     label: Cow<'a, str>,
+    fullscreen_brackets: bool,
     show_windows: bool,
 }
 
@@ -377,6 +397,7 @@ fn render_inputs<'a>(
     let show_windows = settings.display_style == WorkspaceDisplayStyle::Layout;
     displays
         .iter()
+        .filter(|display| !settings.current_display_only || display.is_active_context)
         .flat_map(|display| {
             display
                 .workspaces
@@ -394,8 +415,16 @@ fn render_inputs<'a>(
                     label: if show_windows {
                         Cow::Borrowed("")
                     } else {
-                        workspace_label(workspace, settings.active_label)
+                        let label = workspace_label(workspace, settings.active_label);
+                        if settings.show_fullscreen_indicator && workspace.has_fullscreen {
+                            Cow::Owned(format!("[{label}]"))
+                        } else {
+                            label
+                        }
                     },
+                    fullscreen_brackets: show_windows
+                        && settings.show_fullscreen_indicator
+                        && workspace.has_fullscreen,
                     show_windows,
                 })
         })
@@ -413,6 +442,7 @@ struct WorkspaceRenderKey {
     space: SpaceId,
     workspace_id: String,
     label: String,
+    fullscreen_brackets: bool,
     show_windows: bool,
     is_active: bool,
     window_count: usize,
@@ -428,6 +458,7 @@ impl MenuIconRenderKey {
                 space: input.space,
                 workspace_id: input.workspace.id.clone(),
                 label: input.label.to_string(),
+                fullscreen_brackets: input.fullscreen_brackets,
                 show_windows: input.show_windows,
                 is_active: input.workspace.is_active,
                 window_count: input
@@ -465,6 +496,7 @@ impl MenuIconRenderKey {
                     && key.space == input.space
                     && key.workspace_id == input.workspace.id
                     && key.label == input.label
+                    && key.fullscreen_brackets == input.fullscreen_brackets
                     && key.show_windows == input.show_windows
                     && key.is_active == input.workspace.is_active
                     && (!input.show_windows || key.window_count == input.workspace.window_count)
@@ -1204,6 +1236,7 @@ mod layout_library_tests {
             is_active: active,
             window_count: 0,
             windows: Vec::new(),
+            has_fullscreen: false,
         }
     }
 
@@ -1343,6 +1376,27 @@ mod layout_library_tests {
     }
 
     #[test]
+    fn current_display_only_follows_the_active_menu_bar_display() {
+        let mut displays = displays();
+        for display_style in [WorkspaceDisplayStyle::Label, WorkspaceDisplayStyle::Layout] {
+            let settings = MenuBarSettings {
+                current_display_only: true,
+                show_empty: true,
+                display_style,
+                ..Default::default()
+            };
+            for active in 0..2 {
+                for (index, display) in displays.iter_mut().enumerate() {
+                    display.is_active_context = index == active;
+                }
+                let inputs = render_inputs(&displays, &settings);
+                assert_eq!(inputs.len(), 2);
+                assert!(inputs.iter().all(|input| input.space == SpaceId::new(active as u64 + 1)));
+            }
+        }
+    }
+
+    #[test]
     fn grouped_geometry_highlights_both_displays_without_outer_gaps() {
         let displays = displays();
         let attrs = build_text_attrs(&NSFont::systemFontOfSize_weight(FONT_SIZE, unsafe {
@@ -1437,6 +1491,55 @@ mod layout_library_tests {
     }
 
     #[test]
+    fn fullscreen_indicator_brackets_labels_and_layouts_only_when_enabled() {
+        let mut displays = displays();
+        displays[0].workspaces[1].name = "Development".into();
+        displays[0].workspaces[1].has_fullscreen = true;
+        let labels = |displays: &[DisplayWorkspaces], settings: &MenuBarSettings| {
+            render_inputs(displays, settings)
+                .iter()
+                .map(|input| input.label.to_string())
+                .collect::<Vec<_>>()
+        };
+        let mut settings = MenuBarSettings {
+            display_style: WorkspaceDisplayStyle::Label,
+            active_label: ActiveWorkspaceLabel::Name,
+            show_empty: true,
+            ..Default::default()
+        };
+        assert_eq!(labels(&displays, &settings)[1], "Development");
+
+        settings.show_fullscreen_indicator = true;
+        let enabled = labels(&displays, &settings);
+        assert_eq!(enabled[1], "[Development]");
+        assert_eq!(enabled.iter().filter(|label| label.starts_with('[')).count(), 1);
+        let key = MenuIconRenderKey::from_inputs(&render_inputs(&displays, &settings));
+        displays[0].workspaces[1].has_fullscreen = false;
+        assert!(!key.matches_inputs(&render_inputs(&displays, &settings)));
+        assert_eq!(labels(&displays, &settings)[1], "Development");
+
+        // Layout style draws miniatures, not labels.
+        displays[0].workspaces[1].has_fullscreen = true;
+        settings.display_style = WorkspaceDisplayStyle::Layout;
+        assert!(labels(&displays, &settings).iter().all(String::is_empty));
+        let inputs = render_inputs(&displays, &settings);
+        let attrs = build_text_attrs(&NSFont::systemFontOfSize(12.0));
+        let layout = build_layout(&inputs, &attrs);
+        assert!(layout.workspaces[1].fullscreen_brackets);
+        assert_eq!(
+            layout.workspaces.iter().filter(|w| w.fullscreen_brackets).count(),
+            1
+        );
+        let key = MenuIconRenderKey::from_inputs(&inputs);
+        settings.show_fullscreen_indicator = false;
+        let inputs = render_inputs(&displays, &settings);
+        assert!(!key.matches_inputs(&inputs));
+        let plain = build_layout(&inputs, &attrs);
+        assert!(plain.workspaces.iter().all(|w| !w.fullscreen_brackets));
+        assert_eq!(layout.size.width, plain.size.width + 8.0);
+    }
+
+    #[test]
     fn render_key_tracks_second_display_identity_order_and_state() {
         let base = displays();
         let settings = MenuBarSettings {
@@ -1472,6 +1575,7 @@ mod layout_library_tests {
             space: SpaceId::new(1),
             workspace: &workspace,
             label: Cow::Borrowed("1"),
+            fullscreen_brackets: false,
             show_windows: false,
         }]);
 
@@ -1480,6 +1584,7 @@ mod layout_library_tests {
             space: SpaceId::new(1),
             workspace: &workspace,
             label: Cow::Borrowed("1"),
+            fullscreen_brackets: false,
             show_windows: false,
         }]));
 
@@ -1489,6 +1594,7 @@ mod layout_library_tests {
             space: SpaceId::new(1),
             workspace: &workspace,
             label: Cow::Borrowed("1"),
+            fullscreen_brackets: false,
             show_windows: false,
         }]));
     }
@@ -1541,13 +1647,15 @@ fn build_cached_text_line(
 }
 
 impl MenuIconView {
-    fn new(mtm: MainThreadMarker) -> Self {
+    fn new(mtm: MainThreadMarker) -> Self { Self::build(mtm, true) }
+
+    fn build(mtm: MainThreadMarker, clear_background: bool) -> Self {
         let font = NSFont::systemFontOfSize_weight(FONT_SIZE, unsafe { NSFontWeightMedium });
         let text_attrs = build_text_attrs(font.as_ref());
         let layout = Rc::new(RefCell::new(MenuIconLayout::default()));
         let draw_layout = layout.clone();
         let canvas = Canvas::new(&Ui::new(mtm), move |cg, bounds| {
-            draw_menu_icon(cg, bounds, &draw_layout.borrow())
+            draw_menu_icon(cg, bounds, &draw_layout.borrow(), clear_background)
         });
         Self { canvas, layout, text_attrs }
     }
@@ -1561,6 +1669,93 @@ impl std::ops::Deref for MenuIconView {
     type Target = NSView;
 
     fn deref(&self) -> &NSView { self.canvas.ns_view() }
+}
+
+/// An embedded indicator using the status item's exact layout and drawing path.
+/// No NSStatusItem, menu, filesystem scan, or runtime subscription is created.
+pub struct MenuBarPreview {
+    view: MenuIconView,
+    displays: Vec<DisplayWorkspaces>,
+}
+impl MenuBarPreview {
+    pub fn new(ui: &Ui) -> Self {
+        let frame = |x, y, w, h| CGRect::new(CGPoint::new(x, y), CGSize::new(w, h));
+        let workspaces = [
+            ("Writing", vec![
+                frame(0.0, 0.0, 600.0, 800.0),
+                frame(600.0, 0.0, 600.0, 800.0),
+            ]),
+            ("Development", vec![
+                frame(0.0, 0.0, 800.0, 800.0),
+                frame(800.0, 0.0, 400.0, 400.0),
+                frame(800.0, 400.0, 400.0, 400.0),
+            ]),
+            ("Reading", vec![frame(0.0, 0.0, 1200.0, 800.0)]),
+            ("Planning", vec![]),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, (name, windows))| Workspace {
+            id: name.into(),
+            index: i,
+            name: name.into(),
+            layout_mode: "bsp".into(),
+            is_active: i == 1,
+            window_count: windows.len(),
+            windows,
+            has_fullscreen: name == "Reading",
+        })
+        .collect();
+        // The containing native material owns the backdrop. Clear only the
+        // standalone status-item surface, never an embedded menu bar's backing.
+        let view = MenuIconView::build(ui.mtm(), false);
+        Self {
+            view,
+            displays: vec![
+                DisplayWorkspaces {
+                    display_uuid: "preview".into(),
+                    space: SpaceId::new(1),
+                    is_active_context: true,
+                    workspaces,
+                },
+                DisplayWorkspaces {
+                    display_uuid: "preview-secondary".into(),
+                    space: SpaceId::new(2),
+                    is_active_context: false,
+                    workspaces: vec![Workspace {
+                        id: "mail".into(),
+                        index: 0,
+                        name: "Mail".into(),
+                        layout_mode: "bsp".into(),
+                        is_active: true,
+                        window_count: 1,
+                        windows: vec![frame(0.0, 0.0, 1200.0, 800.0)],
+                        has_fullscreen: false,
+                    }],
+                },
+            ],
+        }
+    }
+
+    pub fn update(&self, settings: &MenuBarSettings) {
+        let mut layout =
+            build_layout(&render_inputs(&self.displays, settings), &self.view.text_attrs);
+        if settings.show_binding_mode {
+            if let Some(line) = build_cached_text_line("resize", &self.view.text_attrs) {
+                let x = layout.size.width + SEPARATOR_SPACING;
+                layout.size.width = x + line.width;
+                layout.binding_mode = Some((x, line));
+            }
+        }
+        self.view.canvas.ns_view().setHidden(!settings.enabled);
+        // Intrinsic width is represented by one stable constraint, owned by the host.
+        self.view.set_layout(layout);
+    }
+
+    pub fn width(&self) -> f64 { self.view.layout.borrow().size.width }
+}
+impl cgs::NativeView for MenuBarPreview {
+    fn ns_view(&self) -> &NSView { self.view.canvas.ns_view() }
 }
 
 fn label_cell_width(text_width: f64) -> f64 {
@@ -1611,12 +1806,15 @@ fn build_layout(
         } else {
             label_cell_width(label_line.as_ref().map_or(0.0, |line| line.width))
         };
+        if input.fullscreen_brackets {
+            width += 4.0;
+        }
         let bg_rect = if input.show_windows {
             workspace_cell_rect(width, cell_width, height)
         } else {
             CGRect::new(CGPoint::new(width, 0.0), CGSize::new(cell_width, height))
         };
-        width += cell_width;
+        width += cell_width + if input.fullscreen_brackets { 4.0 } else { 0.0 };
 
         let fill_alpha = if input.show_windows {
             if workspace.is_active {
@@ -1661,6 +1859,7 @@ fn build_layout(
             fill_alpha,
             windows,
             label_line,
+            fullscreen_brackets: input.fullscreen_brackets,
         });
     }
 
@@ -1668,6 +1867,7 @@ fn build_layout(
         workspaces,
         separators,
         separator_line,
+        binding_mode: None,
         size: CGSize::new(width, height),
     }
 }
@@ -1688,13 +1888,30 @@ fn add_rounded_rect(ctx: &CGContext, x: f64, y: f64, w: f64, h: f64, r: f64) {
     CGContext::close_path(ctx);
 }
 
-fn draw_menu_icon(cg: &CGContext, bounds: CGRect, layout: &MenuIconLayout) {
-    CGContext::clear_rect(Some(cg), bounds);
+fn draw_menu_icon(cg: &CGContext, bounds: CGRect, layout: &MenuIconLayout, clear_background: bool) {
+    if clear_background {
+        CGContext::clear_rect(Some(cg), bounds);
+    }
+    // AppKit text controls may leave a flipped text matrix in an embedded
+    // drawing context. Core Text needs its own upright point-space matrix.
+    CGContext::set_text_matrix(Some(cg), CGAffineTransform {
+        a: 1.0,
+        b: 0.0,
+        c: 0.0,
+        d: 1.0,
+        tx: 0.0,
+        ty: 0.0,
+    });
+    CGContext::set_alpha(Some(cg), 1.0);
+    CGContext::set_blend_mode(Some(cg), CGBlendMode::Normal);
+    unsafe {
+        CGContext::begin_transparency_layer(Some(cg), None);
+    }
 
     let y_offset = (bounds.size.height - layout.size.height) / 2.0;
     // Resolve dynamic AppKit color at draw time, under the view's effective appearance.
     let foreground = NSColor::labelColor();
-    CGContext::set_rgb_stroke_color(Some(cg), 1.0, 1.0, 1.0, 1.0);
+    foreground.setStroke();
     CGContext::set_line_width(Some(cg), BORDER_WIDTH);
 
     for workspace in layout.workspaces.iter() {
@@ -1718,7 +1935,7 @@ fn draw_menu_icon(cg: &CGContext, bounds: CGRect, layout: &MenuIconLayout) {
                 CGContext::begin_transparency_layer(Some(cg), None);
             }
         } else {
-            CGContext::set_rgb_stroke_color(Some(cg), 1.0, 1.0, 1.0, 1.0);
+            foreground.setStroke();
         }
         let rect = workspace.bg_rect;
         let bg_y = rect.origin.y + y_offset;
@@ -1732,7 +1949,7 @@ fn draw_menu_icon(cg: &CGContext, bounds: CGRect, layout: &MenuIconLayout) {
                 rect.size.height,
                 corner_radius,
             );
-            CGContext::set_rgb_fill_color(Some(cg), 1.0, 1.0, 1.0, workspace.fill_alpha);
+            foreground.colorWithAlphaComponent(workspace.fill_alpha).setFill();
             if is_label {
                 foreground.setFill();
             }
@@ -1767,7 +1984,7 @@ fn draw_menu_icon(cg: &CGContext, bounds: CGRect, layout: &MenuIconLayout) {
                 window.size.height,
                 1.5,
             );
-            CGContext::set_rgb_fill_color(Some(cg), 1.0, 1.0, 1.0, 1.0);
+            foreground.setFill();
             CGContext::fill_path(Some(cg));
 
             CGContext::save_g_state(Some(cg));
@@ -1782,6 +1999,24 @@ fn draw_menu_icon(cg: &CGContext, bounds: CGRect, layout: &MenuIconLayout) {
                 window.size.height,
                 1.5,
             );
+            CGContext::stroke_path(Some(cg));
+            CGContext::restore_g_state(Some(cg));
+        }
+
+        if workspace.fullscreen_brackets {
+            CGContext::save_g_state(Some(cg));
+            foreground.setStroke();
+            CGContext::set_line_width(Some(cg), 1.0);
+            CGContext::begin_path(Some(cg));
+            for (x, inward) in [
+                (rect.origin.x - 3.0, 2.0),
+                (rect.origin.x + rect.size.width + 3.0, -2.0),
+            ] {
+                CGContext::move_to_point(Some(cg), x + inward, bg_y);
+                CGContext::add_line_to_point(Some(cg), x, bg_y);
+                CGContext::add_line_to_point(Some(cg), x, bg_y + rect.size.height);
+                CGContext::add_line_to_point(Some(cg), x + inward, bg_y + rect.size.height);
+            }
             CGContext::stroke_path(Some(cg));
             CGContext::restore_g_state(Some(cg));
         }
@@ -1809,6 +2044,14 @@ fn draw_menu_icon(cg: &CGContext, bounds: CGRect, layout: &MenuIconLayout) {
         }
     }
 
+    if let Some((x, line)) = &layout.binding_mode {
+        foreground.setFill();
+        let baseline = centered_origin(y_offset, layout.size.height, line.ascent + line.descent)
+            + line.descent;
+        CGContext::set_text_position(Some(cg), *x, baseline);
+        unsafe { line.line.draw(cg) };
+    }
+
     if let Some(line) = &layout.separator_line {
         foreground.setFill();
         CGContext::set_alpha(Some(cg), 0.6);
@@ -1826,4 +2069,5 @@ fn draw_menu_icon(cg: &CGContext, bounds: CGRect, layout: &MenuIconLayout) {
             }
         }
     }
+    CGContext::end_transparency_layer(Some(cg));
 }

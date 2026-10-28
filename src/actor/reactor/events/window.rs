@@ -32,7 +32,7 @@ pub fn handle_window_created(
         window,
         window_server_info: ws_info,
     } = payload;
-    if let Some(previous) = state.windows.reconcile_ax_identity(wid, window.sys_id, None) {
+    if let Some(previous) = state.windows.reconcile_ax_identity(wid, window.sys_id) {
         layout.layout_engine.transfer_persistent_window_identity(previous, wid);
     }
     if let Some(info) = ws_info {
@@ -54,7 +54,9 @@ pub fn handle_window_created(
     state.windows.insert_window(wid, window_state);
     let _ = utils::refresh_heuristic(state, wid);
 
-    let outcome = EventOutcome::window_membership_changed(false, true);
+    // Excluded windows only need lifecycle notifications; app-rule admission arranges itself.
+    let outcome = EventOutcome::window_membership_changed(false, true)
+        .with_arrange_passes(state.windows.is_admitted(wid).into());
     Ok(if state.windows.can_reconcile_admission(wid) {
         outcome.with_created_window_finalization(wid)
     } else {
@@ -74,6 +76,10 @@ pub fn handle_window_destroyed(
     payload: WindowDestroyedPayload,
 ) -> EventOutcome {
     let wid = payload.window;
+    if state.windows.suspend_fullscreen_ax_identity(wid) {
+        return EventOutcome::no_change()
+            .with_layout_event(LayoutEvent::WindowRemovedPreserveFloating(wid));
+    }
     let Some(record) = state.windows.remove_window(wid) else {
         return EventOutcome::no_change();
     };
@@ -105,9 +111,14 @@ pub fn handle_window_minimized(
     if !state.windows.observe_minimized(wid) {
         return Ok(EventOutcome::no_change());
     }
+    let removal = if state.windows.native_fullscreen_record_for_window(wid).is_some() {
+        LayoutEvent::WindowRemovedPreserveFloating(wid)
+    } else {
+        LayoutEvent::WindowRemoved(wid)
+    };
     Ok(EventOutcome::window_membership_changed(false, false)
         .with_arrange_passes(0)
-        .with_layout_event(LayoutEvent::WindowRemoved(wid)))
+        .with_layout_event(removal))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -137,7 +148,15 @@ pub fn handle_window_deminiaturized(
         }
     }
     let _ = utils::refresh_heuristic(state, wid);
-    state.windows.set_visibility(wid, WindowVisibility::Visible);
+    // Minimizing ordered the window out; restoring orders it back in. Without
+    // native visibility, inventory treats it as an AX-only fallback and skips
+    // it while other windows of the app are visible.
+    match state.windows.record(wid).and_then(|record| record.window_server_id()) {
+        Some(wsid) => {
+            state.windows.mark_window_visible(wsid);
+        }
+        None => state.windows.set_visibility(wid, WindowVisibility::Visible),
+    }
 
     // Minimized AX snapshots can have stale admission metadata. Refresh them
     // even when the cached snapshot cannot currently be admitted.
@@ -293,15 +312,19 @@ pub fn handle_window_frame_changed(
     }
     outcome = EventOutcome::layout_changed(false);
 
+    state.windows.clear_floating_display_geometry(wid);
     // External moves as well as resizes are authoritative for floating layouts.
     // Requested frame acknowledgements have already been filtered by the classifier.
     if let Some(space) = assigned_space.or(old_space)
         && Some(space) == new_space
-        && let Some(workspace) = state.windows.workspace_for_window(space, wid)
-        && layout.layout_engine.workspaces().workspaces[workspace].layout_mode()
-            == crate::common::config::LayoutMode::Floating
+        && let Some(workspace) =
+            layout
+                .layout_engine
+                .workspaces()
+                .workspace_for_window(&state.windows, space, wid)
+        && layout.layout_engine.is_window_floating(wid)
     {
-        layout.layout_engine.store_floating_position(space, workspace, wid, new_frame);
+        layout.layout_engine.store_floating_position(workspace, wid, new_frame);
     }
 
     let dragging = mouse_state == Some(MouseState::Down) || drag.actor.is_active();
@@ -309,6 +332,8 @@ pub fn handle_window_frame_changed(
         let tiled = !layout.layout_engine.is_window_floating(wid);
         let native_resize = !old_frame.size.same_as(new_frame.size);
         if !drag.actor.update_native(wid, new_frame, new_space) {
+            // The start of a user drag is intent, even when no workspace changes.
+            layout.layout_engine.forget_native_layout_for_window(&state.windows, wid);
             let session_id = drag.actor.await_native(wid);
             let scene = if tiled && !native_resize {
                 new_space.map_or_else(crate::actor::drag::DragScene::default, |space| {

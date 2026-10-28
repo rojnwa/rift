@@ -160,7 +160,8 @@ pub struct WorkspaceSwitchManager {
     pub workspace_switch_generation: u64,
     pub active_workspace_switch: Option<u64>,
     pub pending_workspace_switch_origin: Option<WorkspaceSwitchOrigin>,
-    pub pending_workspace_mouse_warp: Option<WindowId>,
+    pub pending_focus_mouse_warp: Option<WindowId>,
+    pub pending_display_warp: Option<crate::sys::screen::SpaceId>,
 }
 
 impl WorkspaceSwitchManager {
@@ -389,11 +390,10 @@ impl LayoutManager {
             &gaps,
             reactor.config.settings.ui.stack_line.reserve(),
         );
-        let fullscreen = reactor.workspace_command_space() == Some(space)
-            && reactor
-                .layout_manager
-                .layout_engine
-                .active_workspace_for_space_has_fullscreen(space);
+        let fullscreen = reactor
+            .layout_manager
+            .layout_engine
+            .active_workspace_for_space_has_fullscreen(space);
         Self::publish_stack_tabs(reactor, space, &groups, fullscreen, true);
     }
 
@@ -403,21 +403,51 @@ impl LayoutManager {
         is_workspace_switch: bool,
         space_scope: Option<SpaceId>,
     ) -> Result<bool, crate::model::reactor::ReactorError> {
+        if reactor.refreshes_blocked() {
+            return Ok(false);
+        }
         let layout_result = Self::calculate_layout(reactor, space_scope);
-        Self::apply_layout(reactor, layout_result, is_resize, is_workspace_switch)
+        Self::apply_layout(reactor, layout_result, is_resize, is_workspace_switch, false)
+    }
+
+    pub fn update_layout_instant(
+        reactor: &mut Reactor,
+        space_scope: Option<SpaceId>,
+    ) -> Result<bool, crate::model::reactor::ReactorError> {
+        if reactor.refreshes_blocked() {
+            return Ok(false);
+        }
+        let layout = Self::calculate_layout(reactor, space_scope);
+        // Finish the logical scrolling viewport here, without queueing a second
+        // animation behind the overview's own transition.
+        for &(space, _) in &layout {
+            let engine = &mut reactor.layout_manager.layout_engine;
+            if let Some((workspace, layout)) = engine.workspaces().active_layout_for_space(space)
+                && let crate::layout_engine::LayoutSystemKind::Scrolling(system) =
+                    &mut engine.workspaces_mut().workspaces[workspace].layout_system
+                && let Some((mut camera, _)) = system.presentation(layout)
+            {
+                camera.finish();
+                system
+                    .commit_presented_viewport(layout, &camera.snapshot(std::time::Instant::now()));
+            }
+        }
+        let layout = Self::calculate_layout(reactor, space_scope);
+        Self::apply_layout(reactor, layout, false, false, true)
     }
 
     fn calculate_layout(reactor: &mut Reactor, space_scope: Option<SpaceId>) -> LayoutResult {
         if reactor.state.windows.tracked_window_count() == 0 {
             return LayoutResult::new();
         }
-        let screens = reactor.space_state.screens.clone();
-        let all_screen_frames: Vec<CGRect> = screens.iter().map(|s| s.frame).collect();
+        let all_screen_frames: Vec<CGRect> =
+            reactor.space_state.screens.iter().map(|s| s.frame).collect();
         let mut layout_result = LayoutResult::new();
         let mut screens_in_scope = Vec::new();
 
-        for screen in screens {
-            let Some(space) = screen.space else {
+        for index in 0..reactor.space_state.screens.len() {
+            let screen = &reactor.space_state.screens[index];
+            let (Some(space), frame) = (screen.space, screen.frame) else {
                 continue;
             };
             if space_scope.is_some_and(|scope| scope != space) {
@@ -441,7 +471,7 @@ impl LayoutManager {
                 reactor.layout_manager.layout_engine.calculate_layout_with_virtual_workspaces(
                     &reactor.state.windows,
                     space,
-                    screen.frame.clone(),
+                    frame,
                     &gaps,
                     reactor.config.settings.ui.stack_line.reserve(),
                     |wid| reactor.state.windows.window(wid).map(|w| w.frame_monotonic),
@@ -449,8 +479,7 @@ impl LayoutManager {
                 );
             if reactor.layout_manager.layout_engine.active_layout_mode_at(space)
                 == LayoutMode::Scrolling
-                && let Some(bounds) =
-                    ScrollingDisplayBounds::for_screen(screen.frame, &all_screen_frames)
+                && let Some(bounds) = ScrollingDisplayBounds::for_screen(frame, &all_screen_frames)
             {
                 let active_workspace_windows: HashSet<WindowId> = reactor
                     .layout_manager
@@ -466,7 +495,7 @@ impl LayoutManager {
                     &active_workspace_windows,
                 );
             }
-            screens_in_scope.push((space, screen.frame));
+            screens_in_scope.push((space, frame));
             layout_result.push((space, layout));
         }
 
@@ -484,6 +513,7 @@ impl LayoutManager {
         layout_result: LayoutResult,
         is_resize: bool,
         is_workspace_switch: bool,
+        instant: bool,
     ) -> Result<bool, crate::model::reactor::ReactorError> {
         let main_window = reactor.main_window();
         trace!(?main_window);
@@ -501,11 +531,12 @@ impl LayoutManager {
                     .layout
                     .gaps
                     .effective_for_display(display_uuid.as_deref());
-                let active_workspace_for_space_has_fullscreen = active_space == Some(space)
-                    && reactor
-                        .layout_manager
-                        .layout_engine
-                        .active_workspace_for_space_has_fullscreen(space);
+                let stack_has_fullscreen = reactor
+                    .layout_manager
+                    .layout_engine
+                    .active_workspace_for_space_has_fullscreen(space);
+                let active_workspace_for_space_has_fullscreen =
+                    active_space == Some(space) && stack_has_fullscreen;
                 let group_infos = reactor.layout_manager.layout_engine.collect_group_containers(
                     space,
                     screen_frame,
@@ -513,13 +544,7 @@ impl LayoutManager {
                     reactor.config.settings.ui.stack_line.reserve(),
                 );
 
-                Self::publish_stack_tabs(
-                    reactor,
-                    space,
-                    &group_infos,
-                    active_workspace_for_space_has_fullscreen,
-                    false,
-                );
+                Self::publish_stack_tabs(reactor, space, &group_infos, stack_has_fullscreen, false);
 
                 if let Some(workspace_id) =
                     reactor.layout_manager.layout_engine.workspaces().active_workspace(space)
@@ -585,15 +610,30 @@ impl LayoutManager {
                 }
             }
 
-            if is_workspace_switch {
+            if instant {
+                any_frame_changed |=
+                    AnimationManager::instant_layout(reactor, space, &layout, skip_wid);
+            } else if is_workspace_switch {
                 any_frame_changed |=
                     AnimationManager::workspace_switch_layout(reactor, space, &layout, skip_wid);
             } else if reactor.workspace_switch_manager.active_workspace_switch.is_some() {
                 any_frame_changed |=
                     AnimationManager::instant_layout(reactor, space, &layout, skip_wid);
             } else {
-                any_frame_changed |=
-                    AnimationManager::animate_layout(reactor, space, &layout, is_resize, skip_wid);
+                any_frame_changed |= AnimationManager::animate_layout(
+                    reactor, space, &layout, is_resize, skip_wid, true,
+                );
+            }
+            if let Some(window) = reactor.workspace_switch_manager.pending_focus_mouse_warp
+                && reactor.workspace_switch_manager.pending_display_warp.is_none()
+                && reactor.layout_manager.layout_engine.active_layout_mode_at(space)
+                    == LayoutMode::Scrolling
+                && let Some((_, frame)) = layout.iter().find(|(wid, _)| *wid == window)
+            {
+                reactor.workspace_switch_manager.pending_focus_mouse_warp = None;
+                if reactor.screen_for_point(frame.mid()).is_some() {
+                    reactor.warp_mouse(frame.mid());
+                }
             }
         }
 

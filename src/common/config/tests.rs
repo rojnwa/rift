@@ -8,6 +8,7 @@ use crate::actor::reactor;
 use crate::actor::wm_controller::WmCommand;
 use crate::common::collections::HashMap;
 use crate::layout_engine::{LayoutCommand, ResizeOrientation};
+use crate::sys::hotkey::Modifiers;
 
 #[test]
 fn scrolling_display_widths_merge_and_validate() {
@@ -237,6 +238,7 @@ fn resize_command_config_supports_legacy_and_oriented_forms() {
             legacy = "resize_window_grow"
             vertical = { resize_window_shrink = "vertical" }
             smart = { resize_window_grow = "smart" }
+            sequence = ["resize_window_shrink", { resize_window_grow = "vertical" }]
             "#,
     )
     .unwrap();
@@ -261,6 +263,39 @@ fn resize_command_config_supports_legacy_and_oriented_forms() {
             ResizeOrientation::Smart
         )))
     );
+    assert_eq!(
+        config.keys["sequence"],
+        WmCommand::Sequence(vec![
+            WmCommand::ReactorCommand(reactor::Command::Layout(LayoutCommand::ResizeWindowShrink(
+                ResizeOrientation::Horizontal
+            ))),
+            WmCommand::ReactorCommand(reactor::Command::Layout(LayoutCommand::ResizeWindowGrow(
+                ResizeOrientation::Vertical
+            ))),
+        ])
+    );
+}
+
+#[test]
+fn menu_bar_binding_mode_label_defaults_on_and_can_be_disabled() {
+    let settings: MenuBarSettings = toml::from_str("").unwrap();
+    assert!(settings.show_binding_mode);
+    assert!(MenuBarSettings::default().show_binding_mode);
+    let settings: MenuBarSettings = toml::from_str("show_binding_mode = false").unwrap();
+    assert!(!settings.show_binding_mode);
+    let roundtrip: MenuBarSettings = toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
+    assert!(!roundtrip.show_binding_mode);
+}
+
+#[test]
+fn menu_bar_fullscreen_indicator_defaults_off_and_can_be_enabled() {
+    let settings: MenuBarSettings = toml::from_str("").unwrap();
+    assert!(!settings.show_fullscreen_indicator);
+    assert!(!MenuBarSettings::default().show_fullscreen_indicator);
+    let settings: MenuBarSettings = toml::from_str("show_fullscreen_indicator = true").unwrap();
+    assert!(settings.show_fullscreen_indicator);
+    let roundtrip: MenuBarSettings = toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
+    assert!(roundtrip.show_fullscreen_indicator);
 }
 
 #[test]
@@ -323,15 +358,15 @@ fn mouse_settings_defaults_and_variants_parse() {
             "#,
     )
     .unwrap();
-    assert_eq!(settings.modifier, MouseModifier::Ctrl);
+    assert_eq!(settings.modifier, MouseModifier::Keys(Modifiers::CONTROL));
     assert_eq!(settings.action1, MouseAction::None);
     assert_eq!(settings.action2, MouseAction::Move);
     assert_eq!(settings.drop_action, MouseDropAction::Stack);
 
     for (alias, expected) in [
-        ("command", MouseModifier::Cmd),
-        ("option", MouseModifier::Alt),
-        ("control", MouseModifier::Ctrl),
+        ("command", MouseModifier::Keys(Modifiers::META)),
+        ("option", MouseModifier::Keys(Modifiers::ALT)),
+        ("control", MouseModifier::Keys(Modifiers::CONTROL)),
     ] {
         let parsed: DragDropSettings = toml::from_str(&format!("modifier = \"{alias}\"")).unwrap();
         assert_eq!(parsed.modifier, expected);
@@ -364,7 +399,10 @@ fn drag_drop_settings_take_precedence_over_legacy_window_snapping() {
             "#,
     )
     .unwrap();
-    assert_eq!(cfg.settings.drag_drop.modifier, MouseModifier::Alt);
+    assert_eq!(
+        cfg.settings.drag_drop.modifier,
+        MouseModifier::Keys(Modifiers::ALT)
+    );
     assert_eq!(cfg.settings.drag_drop.drop_action, MouseDropAction::Stack);
 }
 
@@ -461,11 +499,68 @@ fn binding_mode_config_rejects_bad_targets_reserved_default_and_bad_hotkeys() {
 }
 
 #[test]
+fn command_arrays_parse_save_and_follow_keymap_renames() {
+    use crate::actor::wm_controller::WmCmd;
+
+    let text = r#"
+            [settings]
+            [keys]
+            "Alt + 1" = [{ move_window_to_workspace = 0 }, { binding_mode = "move" }]
+            [binding_modes.move]
+            "1" = [{ move_window_to_workspace = 0 }, { binding_mode = "default" }]
+        "#;
+    let sequence = |mode: &str| {
+        WmCommand::Sequence(vec![
+            WmCommand::Wm(WmCmd::MoveWindowToWorkspace(WorkspaceSelector::Index(0))),
+            WmCommand::Wm(WmCmd::BindingMode(mode.into())),
+        ])
+    };
+    let config = Config::parse(text).unwrap();
+    assert_eq!(config.binding_mode_specs[0].1, [(
+        "Alt + 1".to_string(),
+        sequence("move")
+    )]);
+    assert_eq!(config.binding_mode_specs[1].1, [(
+        "1".to_string(),
+        sequence("default")
+    )]);
+
+    let missing = text.replace("\"default\" }]", "\"missing\" }]");
+    assert!(Config::parse(&missing).unwrap_err().to_string().contains("missing"));
+    for empty in ["[]", "[[]]"] {
+        let config = format!("[settings]\n[keys]\n\"A\" = {empty}");
+        assert!(Config::parse(&config).unwrap_err().to_string().contains("empty"));
+    }
+
+    let mut document = ConfigDocument::parse(text).unwrap();
+    document
+        .update(|source| source.rename_keymap("move", "go".into()).unwrap())
+        .unwrap();
+    let saved = document.to_string();
+    assert!(
+        saved
+            .contains(r#""Alt + 1" = [{ move_window_to_workspace = 0 }, { binding_mode = "go" }]"#),
+        "{saved}"
+    );
+    let source = document.source().unwrap();
+    assert_eq!(source.keys["Alt + 1"], sequence("go"));
+    assert_eq!(source.binding_modes["go"]["1"], sequence("default"));
+}
+
+#[test]
 fn config_validation_rejects_duplicate_binding_mode_names() {
     let mut json = serde_json::to_value(Config::default()).unwrap();
     json["binding_mode_specs"] = serde_json::json!([["default", []], ["default", []]]);
     let config: Config = serde_json::from_value(json).unwrap();
     assert!(config.validate().iter().any(|issue| issue.contains("unique")));
+}
+
+#[test]
+fn config_validation_rejects_empty_command_arrays() {
+    let mut json = serde_json::to_value(Config::default()).unwrap();
+    json["binding_mode_specs"] = serde_json::json!([["default", [["A", []]]]]);
+    let config: Config = serde_json::from_value(json).unwrap();
+    assert!(config.validate().iter().any(|issue| issue.contains("empty")));
 }
 
 #[test]
@@ -513,7 +608,8 @@ fn typed_collections_keep_source_aliases_and_inline_commands() {
             });
             source.virtual_workspaces.workspace_rules.push(WorkspaceLayoutRule {
                 workspace: WorkspaceSelector::Index(1),
-                layout: LayoutMode::Scrolling,
+                layout: Some(LayoutMode::Scrolling),
+                display: None,
             });
             source.keys.insert("comb1 + Q".into(), source.keys["Alt + H"].clone());
             source.binding_modes.insert(
@@ -600,11 +696,13 @@ fn workspace_resize_cleans_removed_assignments_and_preserves_valid_rules() {
     settings.workspace_rules = vec![
         WorkspaceLayoutRule {
             workspace: WorkspaceSelector::Name("three".into()),
-            layout: LayoutMode::Stack,
+            layout: Some(LayoutMode::Stack),
+            display: None,
         },
         WorkspaceLayoutRule {
             workspace: WorkspaceSelector::Index(0),
-            layout: LayoutMode::Bsp,
+            layout: Some(LayoutMode::Bsp),
+            display: None,
         },
     ];
     settings.app_rules = vec![AppWorkspaceRule {
@@ -743,4 +841,131 @@ fn stack_tab_geometry_rejects_unusable_values() {
         let tabs: StackLineSettings = toml::from_str(text).unwrap();
         assert_eq!(tabs.validate().len(), 1, "{text}");
     }
+}
+
+#[test]
+fn workspace_mode_defaults_to_per_display_and_round_trips() {
+    assert_eq!(
+        toml::from_str::<VirtualWorkspaceSettings>("").unwrap().mode,
+        WorkspaceMode::PerDisplay
+    );
+    for (text, mode) in [
+        ("per_display", WorkspaceMode::PerDisplay),
+        ("global", WorkspaceMode::Global),
+    ] {
+        let settings =
+            toml::from_str::<VirtualWorkspaceSettings>(&format!("mode = '{text}'")).unwrap();
+        assert_eq!(settings.mode, mode);
+        assert_eq!(serde_json::to_value(&settings).unwrap()["mode"], text);
+    }
+    for text in [
+        "mode = 'shared'",
+        "mode = 'independent'",
+        "display_mode = 'shared'",
+    ] {
+        assert!(
+            toml::from_str::<VirtualWorkspaceSettings>(text).is_err(),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn ordered_display_preferences_round_trip_and_validate() {
+    let mut document = ConfigDocument::default();
+    for display in [r#""builtin""#, r#"["builtin", "right"]"#] {
+        let rule: WorkspaceLayoutRule =
+            toml::from_str(&format!("workspace = 0\ndisplay = {display}")).unwrap();
+        let expected: toml::Table = toml::from_str(&format!("display = {display}")).unwrap();
+        assert_eq!(
+            toml::Value::try_from(&rule).unwrap()["display"],
+            expected["display"]
+        );
+        document
+            .update(|s| s.virtual_workspaces.workspace_rules = vec![rule.clone()])
+            .unwrap();
+        assert_eq!(document.runtime().unwrap().virtual_workspaces.workspace_rules, [
+            rule
+        ]);
+    }
+    for values in [vec![], vec![""], vec!["builtin", " "]] {
+        let error = document
+            .update(|s| {
+                s.virtual_workspaces.workspace_rules[0].display =
+                    Some(values.into_iter().map(String::from).collect());
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("Workspace rule 0 display preferences"));
+    }
+}
+
+#[test]
+fn workspace_names_reject_explicit_and_generated_collisions() {
+    for names in [vec!["Main", "Dev", "Main"], vec!["Workspace 3"], vec![
+        "",
+        "Workspace 1",
+    ]] {
+        let settings = VirtualWorkspaceSettings {
+            default_workspace_count: 3,
+            workspace_names: names.into_iter().map(String::from).collect(),
+            ..Default::default()
+        };
+        assert!(
+            settings
+                .validate()
+                .iter()
+                .any(|issue| issue.contains("Duplicate workspace name"))
+        );
+    }
+}
+
+#[test]
+fn app_rule_commas_stay_on_the_preceding_line() {
+    let mut base = ConfigDocument::default();
+    base.update(|source| {
+        for id in ["a", "b", "c"] {
+            source.virtual_workspaces.app_rules.push(AppWorkspaceRule {
+                app_id: Some(format!("com.example.{id}")),
+                workspace: Some(WorkspaceSelector::Index(1)),
+                ..Default::default()
+            });
+        }
+    })
+    .unwrap();
+    let mut document = ConfigDocument::parse(&base.to_string().replace("\n\t{", "\n  {")).unwrap();
+    let check = |document: &ConfigDocument, expected: usize| {
+        let text = document.to_string();
+        assert!(
+            !text.lines().any(|line| line.trim_start().starts_with(',')),
+            "{text}"
+        );
+        let start = text.rfind("\napp_rules = [").unwrap();
+        let end = start + text[start..].find("\n]").unwrap();
+        assert!(!text[start..end].contains("\n\n"), "{text}");
+        assert_eq!(
+            Config::parse(&text).unwrap().virtual_workspaces.app_rules.len(),
+            expected
+        );
+    };
+    document
+        .update(|source| {
+            source.virtual_workspaces.app_rules.push(AppWorkspaceRule {
+                app_id: Some("com.example.d".into()),
+                ..Default::default()
+            })
+        })
+        .unwrap();
+    check(&document, 4);
+    document
+        .update(|source| source.virtual_workspaces.app_rules[1].floating = true)
+        .unwrap();
+    check(&document, 4);
+    document
+        .update(|source| drop(source.virtual_workspaces.app_rules.remove(0)))
+        .unwrap();
+    check(&document, 3);
+    document
+        .update(|source| drop(source.virtual_workspaces.app_rules.pop()))
+        .unwrap();
+    check(&document, 2);
 }

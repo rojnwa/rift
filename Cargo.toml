@@ -1,12 +1,13 @@
 [package]
 name = "rift-wm"
-version = "0.6.9"
+version = "0.7.1"
 edition = "2024"
 build = "build.rs"
 
 [workspace]
 members = [".", "crates/rift-client", "crates/rift-protocol", "crates/rift-config-derive"]
 resolver = "3"
+exclude = ["cgs"]
 
 [[bin]]
 name = "rift"
@@ -21,6 +22,15 @@ debug-assertions = true
 overflow-checks = true
 split-debuginfo = "unpacked"
 panic = "unwind"
+
+# Keep native dispatch fast during ordinary cargo run. Signature validation walks
+# Objective-C metadata on every message; application debug assertions stay enabled.
+[profile.dev.package.objc2]
+opt-level = 2
+debug-assertions = false
+
+[profile.dev.package.cgs]
+opt-level = 2
 
 [profile.release]
 opt-level = 3
@@ -49,13 +59,13 @@ doctest = false
 [features]
 default = []
 timing = ["dep:tracing-timing"]
-experimental = ["custom-event-loop", "disable-axuielement-destroyed"]
+experimental = ["disable-axuielement-destroyed"]
 custom-event-loop = ["objc2-foundation/NSDate", "objc2-foundation/NSRunLoop"]
 disable-axuielement-destroyed = []
 
 [dependencies]
 rift-config-derive = { path = "crates/rift-config-derive" }
-cgs = { version = "0.3.5" }#, path = "cgs" }
+cgs = { version = "0.3.18" } #, path = "cgs" }
 anyhow = { version = "1.0.83", default-features = false }
 ascii_tree = "0.1.1"
 thiserror = { version = "2.0.17", default-features = false }
@@ -144,15 +154,6 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
 	"NSURL",
 	"NSValue"
 ]}
-objc2-screen-capture-kit = { version = "0.3.2", default-features = false, features = [
-	"SCScreenshotManager",
-	"SCShareableContent",
-	"libc",
-	"SCStream",
-	"block2",
-	"objc2-core-foundation",
-	"objc2-core-graphics",
-] }
 objc2-quartz-core = { version = "0.3.2", default-features = false, features = [
 	"CAAnimation",
 	"CADisplayLink",

@@ -1,7 +1,7 @@
 //! Paced consumption of cumulative physical motion; no layout preparation here.
 use std::time::{Duration, Instant};
 
-use super::{Reactor, command_workflow};
+use super::Reactor;
 use crate::actor::gesture::{Context, Control, Lifecycle, Motion};
 use crate::layout_engine::{
     EventResponse, LayoutCommand, LayoutId, LayoutSystem, LayoutSystemKind, VirtualWorkspaceId,
@@ -300,32 +300,37 @@ impl Reactor {
         if !self.gesture_space_active(context.space) {
             return false;
         }
-        let (visible_spaces, visible_space_frames) = self.visible_spaces_for_layout(false);
-        let result = command_workflow::handle_command_layout(
-            &mut self.state,
-            &mut self.layout_manager,
-            &mut self.workspace_switch_manager,
-            command_workflow::LayoutCommandPayload {
-                command: if next {
-                    LayoutCommand::NextWorkspace(context.skip_empty)
-                } else {
-                    LayoutCommand::PrevWorkspace(context.skip_empty)
-                },
-                command_space: Some(context.space),
-                visible_spaces,
-                visible_space_frames,
-                post_arrange_mouse_warp: None,
+        self.swipe_workspace(context.space, context.skip_empty, next, context.haptic)
+    }
+
+    pub(super) fn swipe_workspace(
+        &mut self,
+        space: crate::sys::screen::SpaceId,
+        skip_empty: Option<bool>,
+        next: bool,
+        haptic: Option<crate::common::config::HapticPattern>,
+    ) -> bool {
+        let space = self.command_context_space().unwrap_or(space);
+        let result = self.dispatch_layout_command(
+            if next {
+                LayoutCommand::NextWorkspace(skip_empty)
+            } else {
+                LayoutCommand::PrevWorkspace(skip_empty)
             },
+            Some(space),
         );
         let Ok(outcome) = result else { return false };
-        if !outcome.layout_responses.iter().any(|(response, _)| response.changed) {
+        // A global target visible on another display only moves focus there.
+        if !outcome.layout_responses.iter().any(|(response, _)| {
+            response.changed || response.workspace_space.is_some_and(|s| s != space)
+        }) {
             return false;
         }
         // Reconcile cached viewport frames before the switch parks outgoing windows.
         // A late EndWindowAnimation would otherwise reapply the old visible frame.
         self.finish_gesture(None, true);
         self.apply_event_outcome(outcome);
-        if let Some(pattern) = context.haptic {
+        if let Some(pattern) = haptic {
             let _ = crate::sys::haptics::perform_haptic(pattern);
         }
         true
@@ -454,6 +459,59 @@ mod tests {
             control: c.clone(),
         });
         (context, c, motion)
+    }
+
+    #[test]
+    fn shared_workspace_swipe_crosses_displays() {
+        let settings = crate::common::config::VirtualWorkspaceSettings {
+            mode: crate::common::config::WorkspaceMode::Global,
+            default_workspace_count: 4,
+            ..Default::default()
+        };
+        let mut r = test_reactor_with_workspace_settings(&settings);
+        r.config.virtual_workspaces = settings;
+        let (a, b) = (SpaceId::new(11), SpaceId::new(21));
+        r.handle_loop_event(space_state_event(
+            vec![
+                CGRect::new(CGPoint::ZERO, CGSize::new(1000.0, 1000.0)),
+                CGRect::new(CGPoint::new(1000.0, 0.0), CGSize::new(1000.0, 1000.0)),
+            ],
+            vec![Some(a), Some(b)],
+        ));
+        // Contiguous allocation: a owns [0, 1], b owns [2, 3]; a shows 1, b shows 2.
+        let ids: Vec<_> = r.layout_manager.layout_engine.workspaces().catalog().collect();
+        assert!(r.layout_manager.layout_engine.workspaces_mut().set_active_workspace(a, ids[1]));
+        let mut config = Config::default();
+        config.settings.layout.scrolling.gestures.enabled = true;
+        config.settings.layout.scrolling.gestures.animate = Some(false);
+        config.settings.gestures.haptics_enabled = false;
+        config.settings.gestures.skip_empty = false;
+        let (context, _, _) = begin(&mut r, &config, a);
+        let before = r.layout_update_count;
+        assert!(r.gesture_workspace(&context, true), "2 is already visible on b");
+        assert_eq!(r.space_state.command_space, Some(b));
+        assert_eq!(
+            r.layout_update_count, before,
+            "focus-only swipe does not arrange"
+        );
+        // Keep the original gesture context deliberately: navigation must follow
+        // the newly focused display, not the old origin.
+        for (next, owner, index) in [
+            (true, b, 3),
+            (true, a, 0),
+            (true, a, 1),
+            (false, a, 0),
+            (false, b, 3),
+            (false, b, 2),
+            (false, a, 1),
+        ] {
+            assert!(r.gesture_workspace(&context, next));
+            assert_eq!(r.space_state.command_space, Some(owner));
+            assert_eq!(
+                r.layout_manager.layout_engine.workspaces().active_workspace(owner),
+                Some(ids[index])
+            );
+        }
     }
 
     #[test]
@@ -606,10 +664,10 @@ mod tests {
             let mut requests = apps.requests();
             let leases = requests
                 .iter()
-                .filter(|r| matches!(r, Request::BeginWindowAnimation(_)))
+                .filter(|r| matches!(r, Request::BeginWindowAnimation(_, _)))
                 .count();
             assert_eq!(leases, 4, "each camera window acquires its lease once");
-            requests.retain(|r| !matches!(r, Request::BeginWindowAnimation(_)));
+            requests.retain(|r| !matches!(r, Request::BeginWindowAnimation(_, _)));
             assert_eq!(
                 requests.len(),
                 1,
@@ -619,7 +677,7 @@ mod tests {
                 panic!("live scrolling must use the interactive transport");
             };
             let mut written = crate::common::collections::HashSet::default();
-            queue.drain_with(|wid, frame, set_size, _, source, _| {
+            queue.drain_with(|wid, frame, set_size, _, source, _, _| {
                 assert_eq!(source, crate::actor::app::FrameSource::Viewport);
                 assert!(!set_size, "scrolling must only move windows");
                 assert!(frame.same_as(r.state.windows.window(wid).unwrap().frame_monotonic));
@@ -647,7 +705,7 @@ mod tests {
             let reconciled: Vec<_> = requests
                 .iter()
                 .filter_map(|request| match request {
-                    Request::EndWindowAnimation(wid) => Some(*wid),
+                    Request::EndWindowAnimation(wid, _) => Some(*wid),
                     _ => None,
                 })
                 .collect();
@@ -734,7 +792,13 @@ mod tests {
                 let expected = if !enabled || skip_empty || fraction < 1.0 || reverse || cancelled {
                     before
                 } else {
-                    store.prev_workspace(&r.state.windows, ctx.space, before.unwrap(), Some(false))
+                    store.step_workspace(
+                        &r.state.windows,
+                        ctx.space,
+                        before.unwrap(),
+                        Some(false),
+                        crate::layout_engine::Direction::Left,
+                    )
                 };
                 for (total, time) in [(-travel * 0.2, 10), (-travel * 0.5, 20), (-travel, 30)] {
                     m.publish(sample(1, total * 1000.0, time));
@@ -884,11 +948,12 @@ mod tests {
             while let Ok((_, request)) = rx.try_recv() {
                 match request {
                     Request::InteractiveFramesPending(queue) => {
-                        queue.drain_with(|wid, _, _, _, _, _| {
+                        queue.drain_with(|wid, _, _, _, _, _, _| {
                             written.insert(wid);
                         });
                     }
-                    Request::EndWindowAnimation(wid) | Request::CancelWindowAnimation(wid, _) => {
+                    Request::EndWindowAnimation(wid, _)
+                    | Request::CancelWindowAnimation(wid, _, _) => {
                         assert!(
                             !hidden.contains(&wid),
                             "terminal viewport frames must precede workspace hiding"
@@ -899,6 +964,7 @@ mod tests {
                         positions,
                         _,
                         crate::actor::app::FrameMode::Position,
+                        _,
                         _,
                     ) => {
                         for (wid, position) in positions {
@@ -980,7 +1046,7 @@ mod tests {
                 // Drain the preceding gesture wake before checking for stale release writes.
                 while let Ok((_, request)) = app_rx.try_recv() {
                     if let Request::InteractiveFramesPending(queue) = request {
-                        queue.drain_with(|_, _, _, _, _, _| {});
+                        queue.drain_with(|_, _, _, _, _, _, _| {});
                     }
                 }
                 r.gesture_tick();
@@ -1000,7 +1066,7 @@ mod tests {
                 let mut moved = 0;
                 while let Ok((_, request)) = app_rx.try_recv() {
                     if let Request::InteractiveFramesPending(queue) = request {
-                        queue.drain_with(|wid, frame, set_size, _, source, _| {
+                        queue.drain_with(|wid, frame, set_size, _, source, _, _| {
                             assert_eq!(source, FrameSource::Viewport);
                             assert!(!set_size);
                             assert!(

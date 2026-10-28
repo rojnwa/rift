@@ -75,6 +75,10 @@ struct Cli {
     #[arg(long, hide = true)]
     settings: bool,
 
+    /// Internal: recover offscreen windows after this daemon PID exits.
+    #[arg(long, hide = true)]
+    recover_windows: Option<i32>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -106,8 +110,13 @@ fn spawn_supervised<F: Future<Output = ()> + 'static>(
 
 fn main() {
     let entry = rift_wm::ui::settings::timing::start();
-    sigpipe::reset();
     let opt = Cli::parse();
+
+    if let Some(pid) = opt.recover_windows {
+        rift_wm::sys::window_recovery::run(pid).expect("window recovery failed");
+        return;
+    }
+    sigpipe::reset();
 
     if opt.settings {
         rift_wm::ui::settings::timing::finish(entry, "entry/argument parsing");
@@ -208,11 +217,14 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
             Some(broadcast_tx.clone()),
         )
     };
-    layout.finish_loading(
+    if let Err(error) = layout.finish_loading(
         &config.virtual_workspaces,
         &config.settings.layout,
         Some(broadcast_tx.clone()),
-    );
+    ) {
+        eprintln!("Could not apply workspace settings to restored layout: {error}");
+        process::exit(1);
+    }
     let (input_tx, input_rx) = rift_wm::actor::channel();
     let (menu_tx, menu_rx) = rift_wm::actor::channel();
     let (stack_line_tx, stack_line_rx) = rift_wm::actor::channel();
@@ -249,6 +261,9 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
             process::exit(1);
         }
     };
+
+    let _window_recovery =
+        rift_wm::sys::window_recovery::start().expect("could not start window recovery");
 
     let mach_bridge_rx = broadcast_rx;
 
@@ -291,6 +306,7 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
     events_tx.send(reactor::Event::RegisterSenders {
         wm: wm_controller_sender.clone(),
         spaces: spaces_tx.clone(),
+        topology_guard: spaces_actor.topology_guard(),
     });
     let wn_actor = window_notify_actor::WindowNotify::new(
         events_tx.clone(),
@@ -346,11 +362,13 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
     let mission_control = mc_channel.map(|(tx, rx)| {
         MissionControlActor::new(
             config.settings.ui.mission_control.clone(),
+            config.virtual_workspaces.mode == rift_wm::common::config::WorkspaceMode::Global,
             rx,
             tx,
             reactor.clone(),
             mtm,
             input_tx.clone(),
+            stack_line_tx.clone(),
         )
     });
     let mission_control_native = NativeMissionControl::new(events_tx.clone(), mc_native_rx);

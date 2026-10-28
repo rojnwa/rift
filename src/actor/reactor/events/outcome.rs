@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use objc2_core_foundation::{CGPoint, CGRect};
 
 use crate::actor::app::{AppInfo, Request, WindowId, WindowInfo, pid_t};
@@ -61,6 +63,8 @@ pub(crate) struct EventOutcome {
     pub(crate) switch_native_space: Option<Direction>,
     pub(crate) wm_commands: Vec<WmCmd>,
     pub(crate) wm_events: Vec<WmEvent>,
+    pub(crate) overview_activation:
+        Option<(crate::model::VirtualWorkspaceId, Option<WindowId>, Instant)>,
     pub(crate) app_requests: Vec<(pid_t, Request)>,
     pub(crate) window_inventory_requests: Vec<pid_t>,
     pub(crate) topology_reassignments: Vec<TopologyReassignment>,
@@ -70,6 +74,8 @@ pub(crate) struct EventOutcome {
     pub(crate) make_key_windows: Vec<(pid_t, WindowServerId)>,
     pub(crate) mouse_warps: Vec<CGPoint>,
     pub(crate) post_arrange_mouse_warp: Option<WindowId>,
+    /// A workspace switch landed on this other display; carry the cursor there.
+    pub(crate) display_switch_warp: Option<SpaceId>,
     pub(crate) drop_haptic: bool,
     pub(crate) pre_layout_window_frame_writes: Vec<WindowFrameWriteRequest>,
     pub(crate) interactive_window_frame_write: Option<WindowFrameWriteRequest>,
@@ -96,6 +102,8 @@ pub(crate) struct ArrangeRequest {
     /// Zero or one: arrange the final model, regardless of how many reducers requested it.
     pub(crate) passes: u8,
     pub(crate) is_resize: bool,
+    /// The renderer covers this layout transition and owns its visible animation.
+    pub(crate) instant: bool,
     pub(crate) window_was_destroyed: bool,
     pub(crate) space_scope: Option<SpaceId>,
     pub(crate) secondary_space_scope: Option<SpaceId>,
@@ -116,6 +124,7 @@ impl EventOutcome {
         self.switch_native_space = other.switch_native_space.or(self.switch_native_space);
         self.wm_commands.append(&mut other.wm_commands);
         self.wm_events.append(&mut other.wm_events);
+        self.overview_activation = other.overview_activation.or(self.overview_activation);
         self.app_requests.append(&mut other.app_requests);
         self.window_inventory_requests.append(&mut other.window_inventory_requests);
         self.topology_reassignments.append(&mut other.topology_reassignments);
@@ -127,6 +136,7 @@ impl EventOutcome {
         self.drop_haptic |= other.drop_haptic;
         self.post_arrange_mouse_warp =
             other.post_arrange_mouse_warp.or(self.post_arrange_mouse_warp);
+        self.display_switch_warp = other.display_switch_warp.or(self.display_switch_warp);
         if !other.pre_layout_window_frame_writes.is_empty()
             || other.interactive_window_frame_write.is_some()
         {
@@ -162,6 +172,7 @@ impl EventOutcome {
             }
             self.arrange.passes = 1;
             self.arrange.is_resize |= other.arrange.is_resize;
+            self.arrange.instant |= other.arrange.instant;
             self.arrange.window_was_destroyed |= other.arrange.window_was_destroyed;
         }
         self.focused_window = other.focused_window.or(self.focused_window);
@@ -176,6 +187,7 @@ impl EventOutcome {
             arrange: ArrangeRequest {
                 passes: 1,
                 is_resize,
+                instant: false,
                 window_was_destroyed: false,
                 space_scope: None,
                 secondary_space_scope: None,

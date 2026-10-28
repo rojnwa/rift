@@ -57,6 +57,8 @@ pub enum WmEvent {
     SpaceStateUpdated(ForwardedSpaceState, CoordinateConverter),
     PowerStateChanged(bool),
     KeyboardLayoutChanged,
+    OverviewChanged,
+    OverviewActivationTarget(reactor::OverviewTarget),
     ConfigUpdated(crate::common::config::Config),
     Command(WmCommand),
 }
@@ -67,6 +69,16 @@ pub enum WmCommand {
     Wm(WmCmd),
     ConfiguredLayout(ConfiguredLayoutCommand),
     ReactorCommand(reactor::Command),
+    Sequence(Vec<WmCommand>),
+}
+
+impl WmCommand {
+    pub fn steps(&self) -> Box<dyn Iterator<Item = &WmCommand> + '_> {
+        match self {
+            WmCommand::Sequence(commands) => Box::new(commands.iter().flat_map(WmCommand::steps)),
+            command => Box::new(std::iter::once(command)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -250,19 +262,17 @@ impl WmController {
         use self::WmCommand::*;
         use self::WmEvent::*;
 
-        let refresh_overview = matches!(
-            &event,
-            Command(Wm(MoveWindowToWorkspace(_)))
-                | Command(ReactorCommand(_))
-                | Command(ConfiguredLayout(_))
-        );
-        if matches!(&event, SpaceStateUpdated(..))
-            && let Some(tx) = &self.mission_control_tx
-        {
-            tx.send(mission_control::Event::Dismiss);
-        }
-
         match event {
+            OverviewActivationTarget(target) => {
+                if let Some(tx) = &self.mission_control_tx {
+                    tx.send(mission_control::Event::ActivationTarget(target));
+                }
+            }
+            OverviewChanged => {
+                if let Some(tx) = &self.mission_control_tx {
+                    tx.send(mission_control::Event::RefreshCurrentWorkspace);
+                }
+            }
             SpaceStateUpdated(space_state, converter) => {
                 self.events_tx.send(Event::SpaceStateChanged(space_state.clone()));
                 _ = self
@@ -304,6 +314,7 @@ impl WmController {
             AppGloballyActivated(pid) => {
                 _ = self.input_tx.send(input::Request::EnforceHidden);
                 self.events_tx.send(Event::ApplicationGloballyActivated(pid));
+                self.retry_unattached_app(pid);
             }
             AppGloballyDeactivated(pid) => {
                 self.events_tx.send(Event::ApplicationGloballyDeactivated(pid));
@@ -324,6 +335,8 @@ impl WmController {
                 if let Some(tx) = &self.mission_control_tx {
                     tx.send(mission_control::Event::Configure(
                         new_cfg.settings.ui.mission_control.clone(),
+                        new_cfg.virtual_workspaces.mode
+                            == crate::common::config::WorkspaceMode::Global,
                     ));
                 }
                 if !new_cfg.settings.ui.mission_control.enabled {
@@ -434,10 +447,23 @@ impl WmController {
             Command(ReactorCommand(cmd)) => {
                 self.events_tx.send(reactor::Event::Command(cmd));
             }
+            Command(Sequence(commands)) => {
+                for command in commands {
+                    self.handle_event(Command(command));
+                }
+            }
         }
-        if refresh_overview && let Some(tx) = &self.mission_control_tx {
-            tx.send(mission_control::Event::RefreshCurrentWorkspace);
+    }
+
+    /// Attaching fails while an app refuses AX requests; retry when the user activates it.
+    fn retry_unattached_app(&mut self, pid: pid_t) {
+        if self.apps.0.contains_key(&pid) {
+            return;
         }
+        let Some(running_app) = NSRunningApplication::with_process_id(pid) else {
+            return;
+        };
+        self.new_app(pid, AppInfo::from(&*running_app), AppDiscoverySource::Process);
     }
 
     fn new_app(&mut self, pid: pid_t, info: AppInfo, source: AppDiscoverySource) {
