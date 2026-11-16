@@ -9,7 +9,7 @@ pub(crate) mod workspaces;
 pub(crate) use engine::WindowLayoutInfo;
 pub use engine::{
     EventResponse, LayoutCommand, LayoutEngine, LayoutEvent, LayoutEventOutcome, ResolvedWindow,
-    RestoreReport, RestoreRequest, RestoreScope, RestoreSource, RestoreWarning,
+    RestoreReport, RestoreRequest, RestoreScope, RestoreSource,
 };
 pub(crate) use floating::FloatingManager;
 pub use graph::{Direction, LayoutKind, Orientation, ResizeOrientation};
@@ -20,6 +20,7 @@ pub enum WindowDropAction {
     Stack,
     Insert(Direction),
     Move(Direction),
+    ConsumeOrExpel(Direction),
 }
 
 impl From<crate::common::config::MouseDropAction> for WindowDropAction {

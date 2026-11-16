@@ -178,9 +178,9 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "cgs"
-version = "0.3.18"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b8740d47a229605f8c7a96d41515c487bd8ca949b488b466ab60b9b94682a84"
+checksum = "6f6d56081e7292f8abacfe3871475ae1d0d7a63fdceafa74105597dbe2a826fa"
 dependencies = [
  "block2",
  "dispatch2",
@@ -1358,7 +1358,7 @@ dependencies = [
 
 [[package]]
 name = "rift-wm"
-version = "0.7.1"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "ascii_tree",

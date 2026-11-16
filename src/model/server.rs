@@ -347,10 +347,13 @@ mod tests {
             "layout_position": { "column": 2, "row": 1 },
         });
         assert_eq!(value, expected);
-        let mut old = value;
-        old.as_object_mut().unwrap().remove("externally_managed");
-        let decoded: protocol::WindowData = serde_json::from_value(old).unwrap();
-        assert!(!decoded.externally_managed);
+        let mut legacy = value;
+        legacy.as_object_mut().unwrap().remove("externally_managed");
+        assert!(
+            !serde_json::from_value::<protocol::WindowData>(legacy)
+                .unwrap()
+                .externally_managed
+        );
     }
 
     #[test]

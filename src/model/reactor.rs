@@ -85,6 +85,7 @@ pub(crate) struct WindowState {
     /// Rift/macOS heuristic result, kept separately from an explicit app-rule
     /// override so every discovered window can remain tracked.
     pub(crate) is_manageable: bool,
+    pub(crate) native_transient: bool,
     pub(crate) manage_override: Option<bool>,
 }
 
@@ -94,6 +95,7 @@ impl From<WindowInfo> for WindowState {
             frame_monotonic: info.frame,
             info,
             is_manageable: false,
+            native_transient: false,
             manage_override: None,
         }
     }
@@ -113,13 +115,16 @@ impl WindowState {
         }
     }
 
-    /// Normal management policy; layout admission also checks WindowRecord ownership.
+    /// The single admission policy used by every layout-facing caller.
     pub(crate) fn is_admitted(&self) -> bool {
         self.is_admitted_with_override(self.manage_override)
     }
 
     pub(crate) fn is_admitted_with_override(&self, manage_override: Option<bool>) -> bool {
-        !self.info.is_minimized && manage_override.unwrap_or(self.is_manageable)
+        !self.native_transient
+            && !self.info.is_minimized
+            && !crate::sys::app::is_ax_transient(&self.info)
+            && manage_override.unwrap_or(self.is_manageable)
     }
 
     pub(crate) fn can_reconcile_admission(&self) -> bool { !self.info.is_minimized }

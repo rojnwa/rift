@@ -6,7 +6,7 @@ use crate::actor::app::{WindowId, pid_t};
 
 /// i3-style scratchpad membership. Parked windows live on no virtual workspace; shown
 /// members are ordinary floating windows on whichever workspace they were summoned to.
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub(crate) struct Scratchpad {
     /// Hidden members, least recently parked first; `toggle` shows the front.
     parked: VecDeque<WindowId>,
@@ -43,6 +43,12 @@ impl Scratchpad {
 
     pub(crate) fn parked(&self) -> impl Iterator<Item = WindowId> + '_ {
         self.parked.iter().copied()
+    }
+
+    /// Removes the parked members, returning each with whether it was fresh.
+    pub(crate) fn take_parked(&mut self) -> Vec<(WindowId, bool)> {
+        let parked = std::mem::take(&mut self.parked);
+        parked.into_iter().map(|wid| (wid, self.fresh.remove(&wid))).collect()
     }
 
     pub(crate) fn shown(&self) -> impl Iterator<Item = WindowId> + '_ { self.shown.iter().copied() }

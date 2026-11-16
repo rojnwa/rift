@@ -10,7 +10,8 @@ use std::rc::Rc;
 use std::sync::{Arc, mpsc};
 
 use block2::RcBlock;
-use cgs::{Alert, Ui};
+use cgs::Ui;
+use cgs::window::Alert;
 use dispatchr::time::Time;
 use objc2::MainThreadMarker;
 use objc2::rc::autoreleasepool;
@@ -204,6 +205,16 @@ async fn open(
             let _ = closed.send(Message::Closed);
         },
     );
+    settings.set_shortcut_capture(move |recording| {
+        if recording && !NSApplication::sharedApplication(mtm).isActive() {
+            return Err("Activate Settings before recording a shortcut".into());
+        }
+        RiftMachClient::connect()
+            .and_then(|client| client.set_shortcut_recording(std::process::id() as i32, recording))
+            .map_err(|error| {
+                format!("Cannot safely record keys while Rift is unavailable: {error}")
+            })
+    });
     super::timing::finish(construction, "Settings::new");
     if let Some(startup) = startup {
         let updated = std::cell::Cell::new(false);
@@ -625,7 +636,9 @@ fn runtime(client: &RiftMachClient) -> Result<Runtime, ClientError> {
 /// A user-facing message, or `Err` when the daemon itself is unreachable.
 fn recoverable(error: ClientError) -> Result<String, String> {
     match error {
-        ClientError::ServiceUnavailable | ClientError::Mach { .. } => Err(error.to_string()),
+        ClientError::ServiceUnavailable
+        | ClientError::RequestTimedOut
+        | ClientError::Mach { .. } => Err(error.to_string()),
         ClientError::MessageTooLarge => Ok("The configuration is too large for Settings to \
                                             send. Edit the configuration file directly."
             .into()),

@@ -119,6 +119,7 @@ pub struct WindowData {
     pub title: String,
     pub frame: Rect,
     pub is_floating: bool,
+    /// Claimed by an external window manager and excluded from Rift's layout.
     #[serde(default)]
     pub externally_managed: bool,
     pub is_focused: bool,
